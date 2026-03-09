@@ -1,0 +1,132 @@
+{
+  "name": "cursor-session-manager",
+  "displayName": "Cursor Session Manager",
+  "description": "Search, tag, pin, track status, and organize your Cursor agent chat sessions with a rich sidebar panel.",
+  "version": "0.3.0",
+  "publisher": "umangdesai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/umangdesai/cursor-session-manager"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cursor-sessions",
+          "title": "Sessions",
+          "icon": "media/sessions-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "cursor-sessions": [
+        {
+          "type": "webview",
+          "id": "cursorSessions.sidebar",
+          "name": "Agent Sessions"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cursorSessions.refresh",
+        "title": "Refresh Sessions",
+        "category": "Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cursorSessions.search",
+        "title": "Search Sessions",
+        "category": "Sessions",
+        "icon": "$(search)"
+      },
+      {
+        "command": "cursorSessions.pinSession",
+        "title": "Pin Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.unpinSession",
+        "title": "Unpin Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.renameSession",
+        "title": "Rename Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.tagSession",
+        "title": "Tag Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.exportSession",
+        "title": "Export Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.linkSessions",
+        "title": "Link Related Sessions",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.setStatus",
+        "title": "Set Session Status",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.removeTag",
+        "title": "Remove Tag from Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.addBranch",
+        "title": "Add Branch to Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.removeBranch",
+        "title": "Remove Branch from Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.debugCommands",
+        "title": "Debug: List Chat Commands",
+        "category": "Sessions"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "bundle": "node esbuild.mjs",
+    "bundle:watch": "node esbuild.mjs --watch",
+    "package": "npm run compile && node esbuild.mjs --production",
+    "lint": "eslint src --ext ts",
+    "vsix": "npx @vscode/vsce package --no-dependencies --skip-license"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/sql.js": "^1.4.9",
+    "@types/vscode": "^1.95.0",
+    "esbuild": "^0.27.3",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "sql.js": "^1.14.1"
+  }
+}
