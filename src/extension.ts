@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { CursorDbReader } from './services/cursorDbReader';
 import { OverlayStore } from './services/overlayStore';
 import { SessionManager } from './services/sessionManager';
+import { BackupService } from './services/backupService';
 import { SessionSidebarProvider } from './views/sidebarProvider';
 import { log } from './services/logger';
 
@@ -13,6 +14,14 @@ export function activate(context: vscode.ExtensionContext) {
   const dbReader = new CursorDbReader();
   const overlay = new OverlayStore(storageUri);
   const sessionManager = new SessionManager(dbReader, overlay);
+  const backupService = new BackupService(storageUri, 'sessions-overlay.json');
+
+  backupService.runDailyBackup();
+
+  const backupInterval = setInterval(() => {
+    backupService.runDailyBackup();
+  }, 6 * 60 * 60 * 1000); // re-check every 6 hours
+  context.subscriptions.push({ dispose: () => clearInterval(backupInterval) });
 
   const sidebarProvider = new SessionSidebarProvider(
     context.extensionUri,
@@ -346,6 +355,61 @@ export function activate(context: vscode.ExtensionContext) {
           await overlay.removeBranch(selected.sessionId, b.branch);
         }
         vscode.window.showInformationMessage(`Removed ${branchChoice.length} branch(es)`);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cursorSessions.restoreDeleted', async () => {
+      const count = overlay.getHiddenCount();
+      if (count === 0) {
+        vscode.window.showInformationMessage('No deleted sessions to restore.');
+        return;
+      }
+      const answer = await vscode.window.showInformationMessage(
+        `Restore ${count} deleted session(s)? They will reappear in your session list.`,
+        'Restore All',
+        'Cancel',
+      );
+      if (answer === 'Restore All') {
+        const restored = await overlay.unhideAll();
+        sessionManager.invalidateCache();
+        vscode.window.showInformationMessage(`Restored ${restored} session(s).`);
+      }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cursorSessions.restoreFromBackup', async () => {
+      const backups = backupService.listBackups();
+      if (backups.length === 0) {
+        vscode.window.showInformationMessage('No backups available. Backups are created daily and kept for 14 days.');
+        return;
+      }
+      const picks = backups.map(b => ({
+        label: b.date.toLocaleDateString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' }),
+        description: `${(b.sizeBytes / 1024).toFixed(1)} KB`,
+        detail: b.filename,
+        backupPath: b.fullPath,
+      }));
+      const selected = await vscode.window.showQuickPick(picks, {
+        placeHolder: 'Select a backup to restore from',
+      });
+      if (!selected) { return; }
+      const confirm = await vscode.window.showWarningMessage(
+        `Restore session data from ${selected.label}? Your current data will be backed up first.`,
+        { modal: true, detail: 'A snapshot of your current data will be saved before restoring.' },
+        'Restore',
+      );
+      if (confirm === 'Restore') {
+        try {
+          await backupService.restoreFromBackup(selected.backupPath);
+          overlay.reload();
+          sessionManager.invalidateCache();
+          vscode.window.showInformationMessage(`Restored from ${selected.label}. Refresh the sidebar to see changes.`);
+        } catch (err) {
+          vscode.window.showErrorMessage(`Restore failed: ${err}`);
+        }
       }
     }),
   );

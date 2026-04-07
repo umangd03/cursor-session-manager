@@ -4,6 +4,7 @@ src/**
 node_modules/**
 .git/**
 .gitignore
+.env
 tsconfig.json
 esbuild.mjs
 SESSION-NOTES.md

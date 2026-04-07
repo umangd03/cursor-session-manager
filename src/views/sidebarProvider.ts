@@ -100,6 +100,9 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'deleteSession':
           await this.handleDeleteSession(msg.sessionId);
           break;
+        case 'restoreDeleted':
+          await this.handleRestoreDeleted();
+          break;
       }
     });
   }
@@ -119,10 +122,12 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const groups = await this.sessionManager.getGroups();
       const wsPath = this.getCurrentWorkspacePath();
       log.info(`sendRefresh: posting to webview (${tags.length} tags, ${groups.length} groups)`);
+      const hiddenCount = this.overlay.getHiddenCount();
       this.view.webview.postMessage({
         type: 'sessions', sessions, tags, groups,
         workspaceOnly: this.currentWorkspaceOnly,
         hasWorkspace: !!wsPath,
+        hiddenCount,
       });
       log.info('sendRefresh: done');
     } catch (err) {
@@ -255,15 +260,37 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
   private async handleDeleteSession(sessionId: string): Promise<void> {
     const session = await this.sessionManager.getSession(sessionId);
     const name = session?.displayName ?? 'this session';
+    const hasTags = session && session.tags.length > 0;
+    const detail = hasTags
+      ? `Tags: ${session.tags.join(', ')}\n\nYou can restore deleted sessions later via Command Palette > "Sessions: Restore Deleted Sessions".`
+      : 'You can restore deleted sessions later via Command Palette > "Sessions: Restore Deleted Sessions".';
     const answer = await vscode.window.showWarningMessage(
-      `Delete "${name}"? This hides it from your session list.`,
-      { modal: true },
+      `Delete "${name}" from your session list?`,
+      { modal: true, detail },
       'Delete',
     );
     if (answer === 'Delete') {
       await this.overlay.hideSession(sessionId);
       this.sessionManager.invalidateCache();
       await this.sendRefresh();
+      vscode.window.showInformationMessage(
+        `Deleted "${name}". Use "Sessions: Restore Deleted Sessions" to undo.`,
+      );
+    }
+  }
+
+  private async handleRestoreDeleted(): Promise<void> {
+    const count = this.overlay.getHiddenCount();
+    if (count === 0) { return; }
+    const answer = await vscode.window.showInformationMessage(
+      `Restore ${count} deleted session(s)?`,
+      'Restore All', 'Cancel',
+    );
+    if (answer === 'Restore All') {
+      await this.overlay.unhideAll();
+      this.sessionManager.invalidateCache();
+      await this.sendRefresh();
+      vscode.window.showInformationMessage(`Restored ${count} session(s).`);
     }
   }
 
@@ -726,6 +753,21 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     .act-btn.danger { color: var(--error); }
     .act-btn.danger:hover { background: rgba(241,76,76,0.1); border-color: var(--error); }
 
+    /* --- Restore banner --- */
+    .restore-banner {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; margin: 8px 0 0;
+      background: rgba(78,201,176,0.08); border: 1px solid rgba(78,201,176,0.25);
+      border-radius: 6px; font-size: 11.5px; color: var(--dim);
+    }
+    .restore-banner .restore-btn {
+      background: rgba(78,201,176,0.15); color: var(--success); border: 1px solid rgba(78,201,176,0.3);
+      border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer;
+    }
+    .restore-banner .restore-btn:hover {
+      background: rgba(78,201,176,0.25);
+    }
+
     /* --- Detail panel --- */
     .detail-panel { display: none; padding: 0; overflow-y: auto; }
     .detail-panel.active { display: block; animation: fadeIn 0.2s ease-out; }
@@ -895,6 +937,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       <div class="skeleton" style="animation-delay:.45s"></div>
     </div>
     <div class="session-list" id="sessionList" role="list" aria-label="Chat sessions"></div>
+    <div class="restore-banner" id="restoreBanner" style="display:none">
+      <span id="restoreText"></span>
+      <button class="restore-btn" id="restoreBtn">Restore All</button>
+    </div>
   </div>
 
   <div id="detailView" class="detail-panel">
@@ -941,7 +987,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     const detailView = $('detailView');
     const backBtn = $('backBtn');
     const wsToggle = $('wsToggle');
+    const restoreBanner = $('restoreBanner');
+    const restoreText = $('restoreText');
+    const restoreBtn = $('restoreBtn');
     let wsOnly = false;
+
+    restoreBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'restoreDeleted' });
+    });
 
     wsToggle.addEventListener('click', () => {
       wsOnly = !wsOnly;
@@ -1017,6 +1070,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           filterBanner.classList.add('visible');
           filterName.textContent = msg.activeFilter;
         }
+        renderRestoreBanner(msg.hiddenCount || 0);
       }
 
       if (msg.type === 'sessionDetail') {
@@ -1032,6 +1086,15 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       if (pinned > 0) html += '<span>&#x1F4CC; ' + pinned + ' pinned</span>';
       html += '<span>' + totalMsgs + ' messages</span>';
       counterRow.innerHTML = html;
+    }
+
+    function renderRestoreBanner(count) {
+      if (count > 0) {
+        restoreText.textContent = count + ' deleted session' + (count !== 1 ? 's' : '');
+        restoreBanner.style.display = '';
+      } else {
+        restoreBanner.style.display = 'none';
+      }
     }
 
     function renderTags(tags) {

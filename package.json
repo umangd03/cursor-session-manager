@@ -2,7 +2,7 @@
   "name": "cursor-session-manager",
   "displayName": "Cursor Session Manager",
   "description": "Search, tag, pin, track status, and organize your Cursor agent chat sessions with a rich sidebar panel.",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "publisher": "umangdesai",
   "license": "MIT",
   "repository": {
@@ -99,6 +99,16 @@
       {
         "command": "cursorSessions.removeBranch",
         "title": "Remove Branch from Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.restoreDeleted",
+        "title": "Restore Deleted Sessions",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.restoreFromBackup",
+        "title": "Restore from Backup",
         "category": "Sessions"
       },
       {

@@ -1,10 +1,14 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import initSqlJs from 'sql.js/dist/sql-asm.js';
 import type { Database } from 'sql.js';
 import { CursorRawSession, CursorRawMessage } from '../models/types';
 import { log } from './logger';
+
+const execFileAsync = promisify(execFile);
 
 function getCursorDataDir(): string {
   switch (process.platform) {
@@ -41,6 +45,10 @@ interface ComposerEntry {
   activeBranch?: { branchName: string };
   branches?: { branchName: string }[];
   isArchived?: boolean;
+  workspaceIdentifier?: {
+    id?: string;
+    uri?: { fsPath?: string; path?: string };
+  };
 }
 
 interface WorkspaceInfo {
@@ -100,18 +108,23 @@ export class CursorDbReader {
       const allSessions: CursorRawSession[] = [];
       const seenIds = new Set<string>();
 
-      log.info('readAllSessions: scanning workspaces...');
-      const workspaces = this.getAvailableWorkspaces().slice(0, 20);
-      log.info(`readAllSessions: found ${workspaces.length} workspaces`);
+      const globalSessions = await this.readGlobalComposerHeaders();
+      log.info(`readAllSessions: global DB yielded ${globalSessions.length} sessions`);
+      for (const s of globalSessions) {
+        seenIds.add(s.id);
+        allSessions.push(s);
+      }
 
-      for (const ws of workspaces) {
-        log.info(`readAllSessions: reading workspace ${ws.hash} (${ws.folderPath ?? 'unknown path'})`);
-        const composerSessions = await this.readComposerData(ws.dbPath, ws.folderPath);
-        log.info(`readAllSessions: workspace ${ws.hash} yielded ${composerSessions.length} sessions`);
-        for (const session of composerSessions) {
-          if (!seenIds.has(session.id)) {
-            seenIds.add(session.id);
-            allSessions.push(session);
+      if (allSessions.length === 0) {
+        log.info('readAllSessions: global DB empty, falling back to workspace DBs...');
+        const workspaces = this.getAvailableWorkspaces().slice(0, 20);
+        for (const ws of workspaces) {
+          const composerSessions = await this.readWorkspaceComposerData(ws.dbPath, ws.folderPath);
+          for (const session of composerSessions) {
+            if (!seenIds.has(session.id)) {
+              seenIds.add(session.id);
+              allSessions.push(session);
+            }
           }
         }
       }
@@ -124,7 +137,78 @@ export class CursorDbReader {
     }
   }
 
-  private async readComposerData(
+  private async queryLargeDb(dbPath: string, key: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await execFileAsync('sqlite3', [
+        dbPath,
+        `SELECT value FROM ItemTable WHERE key = '${key}'`,
+      ], { maxBuffer: 50 * 1024 * 1024 });
+      return stdout.trim() || undefined;
+    } catch (err) {
+      log.error(`sqlite3 CLI query failed for ${key}`, err);
+      return undefined;
+    }
+  }
+
+  private async readGlobalComposerHeaders(): Promise<CursorRawSession[]> {
+    const globalDbPath = path.join(getCursorDataDir(), 'globalStorage', 'state.vscdb');
+    if (!fs.existsSync(globalDbPath)) { return []; }
+
+    try {
+      const rawValue = await this.queryLargeDb(globalDbPath, 'composer.composerHeaders');
+      if (!rawValue) {
+        log.info('Global DB: composerHeaders not found or empty');
+        return [];
+      }
+
+      const data = JSON.parse(rawValue);
+      const composers: ComposerEntry[] = data?.allComposers ?? [];
+      log.info(`Global DB: parsed ${composers.length} composers`);
+      const sessions: CursorRawSession[] = [];
+
+      for (const entry of composers) {
+        if (!entry.composerId) { continue; }
+
+        const folderPath = entry.workspaceIdentifier?.uri?.fsPath
+          ?? entry.workspaceIdentifier?.uri?.path;
+        const projectHash = folderPath ? this.folderToProjectHash(folderPath) : undefined;
+        const messages = this.loadMessagesForSessionDirect(entry.composerId, projectHash);
+
+        const title = entry.name
+          ?? entry.subtitle
+          ?? this.generateTitle(messages);
+
+        const createdAt = entry.createdAt ?? Date.now();
+        const lastMessageAt = entry.lastUpdatedAt ?? createdAt;
+
+        const gitBranch = entry.activeBranch?.branchName
+          ?? entry.committedToBranch
+          ?? entry.branches?.[0]?.branchName;
+
+        sessions.push({
+          id: entry.composerId,
+          title: title || 'Untitled Session',
+          messages,
+          createdAt,
+          lastMessageAt,
+          gitBranch,
+          linesAdded: entry.totalLinesAdded,
+          linesRemoved: entry.totalLinesRemoved,
+          filesChanged: entry.filesChangedCount,
+          mode: entry.unifiedMode,
+          subtitle: entry.subtitle ?? undefined,
+          workspacePath: folderPath,
+        });
+      }
+
+      return sessions;
+    } catch (err) {
+      log.error('Failed to read global composerHeaders', err);
+      return [];
+    }
+  }
+
+  private async readWorkspaceComposerData(
     dbPath: string,
     folderPath: string | undefined,
   ): Promise<CursorRawSession[]> {

@@ -60,6 +60,12 @@ export class OverlayStore {
     }
   }
 
+  reload(): void {
+    this.data = this.load();
+    this.dirty = false;
+    this._onDidChange.fire(undefined);
+  }
+
   getMetadata(sessionId: string): OverlayMetadata | undefined {
     return this.data.sessions[sessionId];
   }
@@ -284,6 +290,32 @@ export class OverlayStore {
       await this.save();
       this._onDidChange.fire(sessionId);
     }
+  }
+
+  async unhideSession(sessionId: string): Promise<void> {
+    if (!this.data.hiddenSessionIds) { return; }
+    const idx = this.data.hiddenSessionIds.indexOf(sessionId);
+    if (idx !== -1) {
+      this.data.hiddenSessionIds.splice(idx, 1);
+      this.dirty = true;
+      await this.save();
+      this._onDidChange.fire(sessionId);
+    }
+  }
+
+  async unhideAll(): Promise<number> {
+    const count = this.data.hiddenSessionIds?.length ?? 0;
+    if (count > 0) {
+      this.data.hiddenSessionIds = [];
+      this.dirty = true;
+      await this.save();
+      this._onDidChange.fire(undefined);
+    }
+    return count;
+  }
+
+  getHiddenCount(): number {
+    return this.data.hiddenSessionIds?.length ?? 0;
   }
 
   isHidden(sessionId: string): boolean {
