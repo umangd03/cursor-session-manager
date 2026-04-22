@@ -16,6 +16,13 @@ Enhanced session management for Cursor IDE — search, tag, pin, track status, a
 - **Filter by tag** — click any tag to filter the session list
 - **Link related sessions** to create relationships between conversations
 - **Group sessions** into custom named groups
+- **Multi-select and bulk delete** — flip on Select mode in the sidebar, check any number of sessions, and delete them in one go (restorable from the deleted-sessions banner)
+
+### JIRA Integration
+- **Auto-linked tickets** — any `PROJ-123` style key found in a session's name, custom title, or tags is surfaced as a clickable badge
+- **One-click setup** via `Sessions: Configure JIRA Base URL…` (accepts a pasted ticket URL — we normalize back to the origin)
+- **Manual link** per session via the JIRA button on each card when auto-detection isn't what you want
+- Badges open the full `https://<your-instance>/browse/<KEY>` URL in your browser
 
 ### Track Progress
 - **Workflow status** — track sessions through a development lifecycle:
@@ -62,6 +69,10 @@ All commands are available via the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+
 | `Sessions: Add Branch to Session` | Associate a git branch |
 | `Sessions: Remove Branch from Session` | Remove an associated branch |
 | `Sessions: Set Session Status` | Set workflow status (TODO, In Progress, etc.) |
+| `Sessions: Configure JIRA Base URL...` | Guided setup for JIRA ticket links |
+| `Sessions: Set JIRA Ticket for Session` | Link a specific ticket to a session |
+| `Sessions: Open Session's JIRA Ticket` | Open the linked ticket in your browser |
+| `Sessions: Delete Multiple Sessions` | Pick and bulk-delete many at once |
 | `Sessions: Export Session` | Export as Markdown or JSON |
 | `Sessions: Link Related Sessions` | Create relationships between sessions |
 
@@ -72,7 +83,7 @@ Search for "Cursor Session Manager" in the Extensions panel.
 
 ### From .vsix
 ```bash
-cursor --install-extension cursor-session-manager-0.3.0.vsix --force
+cursor --install-extension cursor-session-manager-0.4.1.vsix --force
 ```
 
 ## Development

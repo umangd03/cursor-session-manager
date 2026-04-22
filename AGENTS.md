@@ -41,17 +41,9 @@ Verify the build succeeds with exit code 0 and note the output `.vsix` filename.
 cursor --install-extension cursor-session-manager-<version>.vsix --force
 ```
 
-### 4. Publish to VS Code Marketplace
+### 4. Publish to Open VSX Registry
 
-The VS Code Marketplace does not have CLI auth configured. Inform the user to upload the `.vsix` manually:
-
-- Go to https://marketplace.visualstudio.com/manage
-- Click `...` next to "Cursor Session Manager" > **Update**
-- Upload the `.vsix` file
-
-### 5. Publish to Open VSX Registry
-
-Load the token from `.env` and publish:
+Cursor pulls extensions from Open VSX, so this is the only registry we publish to. Load the token from `.env` and publish:
 
 ```bash
 source .env && npx ovsx publish cursor-session-manager-<version>.vsix -p $OVSX_PAT
@@ -59,16 +51,15 @@ source .env && npx ovsx publish cursor-session-manager-<version>.vsix -p $OVSX_P
 
 The namespace `umangdesai` is already created. This publishes to https://open-vsx.org/extension/umangdesai/cursor-session-manager.
 
-### 6. Confirm to the user
+### 5. Confirm to the user
 
 After publishing, tell the user:
 - The local install is done (reload Cursor to activate)
 - Open VSX publish succeeded (or failed with error)
-- VS Code Marketplace needs manual upload with the `.vsix` path
 
 ## Important Notes
 
 - Never hardcode the Open VSX token in commands or source files. Always read from `.env`.
 - The `.env` file is gitignored and must never be committed.
 - Always run `npm run compile` first to catch TypeScript errors before packaging.
-- The `README.md` is the marketplace landing page -- keep it updated when adding features.
+- The `README.md` is the Open VSX listing page -- keep it updated when adding features.

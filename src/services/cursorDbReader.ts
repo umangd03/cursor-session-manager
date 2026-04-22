@@ -68,6 +68,11 @@ function getSql(): ReturnType<typeof initSqlJs> {
 }
 
 export class CursorDbReader {
+  // Cache of composerId -> transcript file path. Built lazily by scanning
+  // ~/.cursor/projects/<workspace>/agent-transcripts. Keyed by composer id so
+  // we do not depend on Cursor's (fragile) workspace-path-to-folder-name
+  // mapping, which lossily replaces underscores with hyphens.
+  private transcriptIndex: Map<string, string> | null = null;
 
   getAvailableWorkspaces(): WorkspaceInfo[] {
     const results: WorkspaceInfo[] = [];
@@ -105,6 +110,7 @@ export class CursorDbReader {
 
   async readAllSessions(): Promise<CursorRawSession[]> {
     try {
+      this.transcriptIndex = null;
       const allSessions: CursorRawSession[] = [];
       const seenIds = new Set<string>();
 
@@ -276,22 +282,83 @@ export class CursorDbReader {
     composerId: string,
     projectHash: string | undefined,
   ): CursorRawMessage[] {
-    if (!projectHash) { return []; }
-
-    const projectsDir = getCursorProjectsDir();
-    const transcriptsBase = path.join(projectsDir, projectHash, 'agent-transcripts');
-
-    const jsonlPath = path.join(transcriptsBase, composerId, `${composerId}.jsonl`);
-    if (fs.existsSync(jsonlPath)) {
-      return this.parseTranscriptFile(jsonlPath);
+    // Fast path: if the naive folder-name mapping works, use it without the
+    // full directory scan.
+    if (projectHash) {
+      const projectsDir = getCursorProjectsDir();
+      const transcriptsBase = path.join(projectsDir, projectHash, 'agent-transcripts');
+      const jsonlPath = path.join(transcriptsBase, composerId, `${composerId}.jsonl`);
+      if (fs.existsSync(jsonlPath)) {
+        return this.parseTranscriptFile(jsonlPath);
+      }
+      const txtPath = path.join(transcriptsBase, `${composerId}.txt`);
+      if (fs.existsSync(txtPath)) {
+        return this.parseTranscriptFile(txtPath);
+      }
     }
 
-    const txtPath = path.join(transcriptsBase, `${composerId}.txt`);
-    if (fs.existsSync(txtPath)) {
-      return this.parseTranscriptFile(txtPath);
+    // Robust fallback: scan all project directories for a matching composer
+    // id. Cursor's folder-name mapping is lossy (e.g. `_` becomes `-`), and
+    // some workspaces get stored under opaque numeric ids instead of the
+    // human-readable path, so indexing by composer id is the only reliable
+    // lookup.
+    const indexed = this.getTranscriptIndex().get(composerId);
+    if (indexed) {
+      return this.parseTranscriptFile(indexed);
     }
-
     return [];
+  }
+
+  private getTranscriptIndex(): Map<string, string> {
+    if (this.transcriptIndex) { return this.transcriptIndex; }
+    const index = new Map<string, string>();
+    const projectsDir = getCursorProjectsDir();
+    if (!fs.existsSync(projectsDir)) {
+      this.transcriptIndex = index;
+      return index;
+    }
+
+    let projectDirs: fs.Dirent[] = [];
+    try {
+      projectDirs = fs.readdirSync(projectsDir, { withFileTypes: true });
+    } catch (err) {
+      log.error(`Failed to list ${projectsDir}`, err);
+      this.transcriptIndex = index;
+      return index;
+    }
+
+    for (const project of projectDirs) {
+      if (!project.isDirectory()) { continue; }
+      const transcriptsBase = path.join(projectsDir, project.name, 'agent-transcripts');
+      if (!fs.existsSync(transcriptsBase)) { continue; }
+
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(transcriptsBase, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          // {composerId}/{composerId}.jsonl (current layout)
+          const jsonlPath = path.join(transcriptsBase, entry.name, `${entry.name}.jsonl`);
+          if (!index.has(entry.name) && fs.existsSync(jsonlPath)) {
+            index.set(entry.name, jsonlPath);
+          }
+        } else if (entry.isFile() && entry.name.endsWith('.txt')) {
+          // Legacy {composerId}.txt layout
+          const id = entry.name.slice(0, -4);
+          if (!index.has(id)) {
+            index.set(id, path.join(transcriptsBase, entry.name));
+          }
+        }
+      }
+    }
+
+    log.info(`Transcript index: found ${index.size} transcripts across ${projectDirs.length} project dirs`);
+    this.transcriptIndex = index;
+    return index;
   }
 
   private parseTranscriptFile(filePath: string): CursorRawMessage[] {

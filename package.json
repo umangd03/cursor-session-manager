@@ -2,7 +2,7 @@
   "name": "cursor-session-manager",
   "displayName": "Cursor Session Manager",
   "description": "Search, tag, pin, track status, and organize your Cursor agent chat sessions with a rich sidebar panel.",
-  "version": "0.3.2",
+  "version": "0.4.3",
   "publisher": "umangdesai",
   "license": "MIT",
   "repository": {
@@ -112,11 +112,41 @@
         "category": "Sessions"
       },
       {
+        "command": "cursorSessions.configureJiraBaseUrl",
+        "title": "Configure JIRA Base URL...",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.setJiraTicket",
+        "title": "Set JIRA Ticket for Session",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.openJiraTicket",
+        "title": "Open Session's JIRA Ticket",
+        "category": "Sessions"
+      },
+      {
+        "command": "cursorSessions.deleteMultiple",
+        "title": "Delete Multiple Sessions",
+        "category": "Sessions"
+      },
+      {
         "command": "cursorSessions.debugCommands",
         "title": "Debug: List Chat Commands",
         "category": "Sessions"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Cursor Session Manager",
+      "properties": {
+        "cursorSessions.jiraBaseUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Base URL of your Atlassian/JIRA instance used to build clickable ticket links (for example, `https://cisco-sbg.atlassian.net`). Ticket keys like `AIPDQ-14091` are appended as `/browse/AIPDQ-14091`. Run **Sessions: Configure JIRA Base URL...** for a guided setup (accepts a pasted ticket URL). Leave empty to disable JIRA links."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",

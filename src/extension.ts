@@ -5,6 +5,7 @@ import { SessionManager } from './services/sessionManager';
 import { BackupService } from './services/backupService';
 import { SessionSidebarProvider } from './views/sidebarProvider';
 import { log } from './services/logger';
+import { configureJiraBaseUrl, openJiraTicket } from './services/jiraLinker';
 
 export function activate(context: vscode.ExtensionContext) {
   log.init();
@@ -415,6 +416,99 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('cursorSessions.configureJiraBaseUrl', async () => {
+      await configureJiraBaseUrl();
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cursorSessions.setJiraTicket', async () => {
+      const sessions = await sessionManager.getSessions();
+      const picks = sessions.map(s => ({
+        label: s.pinned ? `$(pin) ${s.displayName}` : s.displayName,
+        description: s.jiraTicket ? `Current: ${s.jiraTicket}` : undefined,
+        sessionId: s.id,
+        current: s.jiraTicket ?? '',
+      }));
+      const selected = await vscode.window.showQuickPick(picks, {
+        placeHolder: 'Select a session to link to a JIRA ticket',
+      });
+      if (!selected) { return; }
+
+      const ticket = await vscode.window.showInputBox({
+        prompt: 'Enter JIRA ticket key (leave blank to unset)',
+        placeHolder: 'e.g., AISTUDIO-1234',
+        value: selected.current,
+        validateInput: (val) => {
+          const trimmed = val.trim();
+          if (!trimmed) { return undefined; }
+          return /^[A-Za-z][A-Za-z0-9]+-\d+$/.test(trimmed)
+            ? undefined
+            : 'Expected format like PROJ-1234';
+        },
+      });
+      if (ticket === undefined) { return; }
+      await overlay.setJiraTicket(selected.sessionId, ticket.trim() || undefined);
+      vscode.window.showInformationMessage(
+        ticket.trim()
+          ? `Linked "${selected.label}" to ${ticket.trim().toUpperCase()}`
+          : `Cleared JIRA ticket for "${selected.label}"`,
+      );
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cursorSessions.openJiraTicket', async () => {
+      const sessions = await sessionManager.getSessions();
+      const withTickets = sessions.filter(s => s.jiraTicket);
+      if (withTickets.length === 0) {
+        vscode.window.showInformationMessage('No sessions have a JIRA ticket linked yet.');
+        return;
+      }
+      const picks = withTickets.map(s => ({
+        label: s.jiraTicket!,
+        description: s.displayName,
+        sessionId: s.id,
+        ticket: s.jiraTicket!,
+      }));
+      const selected = await vscode.window.showQuickPick(picks, {
+        placeHolder: 'Select a JIRA ticket to open',
+      });
+      if (!selected) { return; }
+      await openJiraTicket(selected.ticket);
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cursorSessions.deleteMultiple', async () => {
+      const sessions = await sessionManager.getSessions();
+      const picks = sessions.map(s => ({
+        label: s.pinned ? `$(pin) ${s.displayName}` : s.displayName,
+        description: `${s.metrics.messageCount} msgs | ${new Date(s.lastMessageAt).toLocaleDateString()}`,
+        detail: s.tags.length > 0 ? `Tags: ${s.tags.join(', ')}` : undefined,
+        sessionId: s.id,
+      }));
+      const picked = await vscode.window.showQuickPick(picks, {
+        placeHolder: 'Select sessions to delete (space to toggle)',
+        canPickMany: true,
+        matchOnDescription: true,
+        matchOnDetail: true,
+      });
+      if (!picked || picked.length === 0) { return; }
+      const confirm = await vscode.window.showWarningMessage(
+        `Delete ${picked.length} session(s) from your list?`,
+        { modal: true, detail: 'You can restore them later via "Sessions: Restore Deleted Sessions".' },
+        'Delete',
+      );
+      if (confirm !== 'Delete') { return; }
+      const ids = picked.map(p => p.sessionId);
+      const count = await overlay.hideSessions(ids);
+      sessionManager.invalidateCache();
+      vscode.window.showInformationMessage(`Deleted ${count} session(s).`);
+    }),
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('cursorSessions.debugCommands', async () => {
       const allCommands = await vscode.commands.getCommands(true);
       const chatCommands = allCommands.filter(c =>
@@ -432,6 +526,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push({
     dispose() {
+      sidebarProvider.dispose();
       overlay.dispose();
       sessionManager.dispose();
     },

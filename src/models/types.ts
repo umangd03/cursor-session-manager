@@ -69,9 +69,13 @@ export interface OverlayMetadata {
   gitBranch?: string;
   branches: string[];
   notes?: string;
+  jiraTicket?: string;
   createdAt: number;
   updatedAt: number;
 }
+
+/** Matches typical JIRA issue keys, e.g. `AISTUDIO-1234` or `PROJ-42`. */
+export const JIRA_TICKET_REGEX = /\b([A-Z][A-Z0-9]+-\d+)\b/;
 
 export interface SessionMetrics {
   messageCount: number;
@@ -102,6 +106,7 @@ export interface Session {
   relatedSessionIds: string[];
   branches: string[];
   notes?: string;
+  jiraTicket?: string;
   workspacePath?: string;
 
   metrics: SessionMetrics;

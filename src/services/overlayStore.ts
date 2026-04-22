@@ -164,6 +164,15 @@ export class OverlayStore {
     }
   }
 
+  async setJiraTicket(sessionId: string, ticket: string | undefined): Promise<void> {
+    const meta = this.ensureMetadata(sessionId);
+    const normalized = ticket?.trim().toUpperCase();
+    meta.jiraTicket = normalized || undefined;
+    this.touch(meta);
+    await this.save();
+    this._onDidChange.fire(sessionId);
+  }
+
   async linkSessions(sessionIdA: string, sessionIdB: string): Promise<void> {
     const metaA = this.ensureMetadata(sessionIdA);
     const metaB = this.ensureMetadata(sessionIdB);
@@ -290,6 +299,25 @@ export class OverlayStore {
       await this.save();
       this._onDidChange.fire(sessionId);
     }
+  }
+
+  async hideSessions(sessionIds: string[]): Promise<number> {
+    if (!this.data.hiddenSessionIds) {
+      this.data.hiddenSessionIds = [];
+    }
+    let added = 0;
+    for (const id of sessionIds) {
+      if (id && !this.data.hiddenSessionIds.includes(id)) {
+        this.data.hiddenSessionIds.push(id);
+        added++;
+      }
+    }
+    if (added > 0) {
+      this.dirty = true;
+      await this.save();
+      this._onDidChange.fire(undefined);
+    }
+    return added;
   }
 
   async unhideSession(sessionId: string): Promise<void> {

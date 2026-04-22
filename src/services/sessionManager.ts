@@ -9,6 +9,7 @@ import {
   SessionFilter,
   SessionListOptions,
   SessionGroup,
+  JIRA_TICKET_REGEX,
 } from '../models/types';
 
 const CODE_BLOCK_REGEX = /```[\s\S]*?```/g;
@@ -56,21 +57,34 @@ export class SessionManager {
     return this.cachedSessions.find(s => s.id === sessionId);
   }
 
-  async searchSessions(query: string): Promise<Session[]> {
+  /**
+   * Full-text search over sessions.
+   *
+   * - `scope === 'title'` limits the haystack to identity/metadata fields
+   *   (name, auto title, JIRA key, tags, branches, notes) — fast, low noise.
+   * - `scope === 'all'` (default) additionally scans message content, which
+   *   is much more thorough but proportionally more expensive.
+   */
+  async searchSessions(query: string, scope: 'title' | 'all' = 'all'): Promise<Session[]> {
     await this.ensureFresh();
     if (!query.trim()) { return this.cachedSessions; }
 
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const includeMessages = scope !== 'title';
 
     return this.cachedSessions.filter(session => {
-      const searchable = [
+      const haystackParts: string[] = [
         session.displayName,
         session.autoTitle,
+        session.jiraTicket ?? '',
+        session.notes ?? '',
         ...session.tags,
         ...session.branches,
-        session.notes ?? '',
-        ...session.messages.map(m => m.content),
-      ].join(' ').toLowerCase();
+      ];
+      if (includeMessages) {
+        for (const m of session.messages) { haystackParts.push(m.content); }
+      }
+      const searchable = haystackParts.join(' ').toLowerCase();
 
       return terms.every(term => searchable.includes(term));
     });
@@ -135,7 +149,7 @@ export class SessionManager {
     }
   }
 
-  private mergeSession(raw: CursorRawSession, overlay?: { customName?: string; tags: string[]; pinned: boolean; status?: import('../models/types').SessionStatus; groupId?: string; relatedSessionIds: string[]; branches: string[]; notes?: string }): Session {
+  private mergeSession(raw: CursorRawSession, overlay?: { customName?: string; tags: string[]; pinned: boolean; status?: import('../models/types').SessionStatus; groupId?: string; relatedSessionIds: string[]; branches: string[]; notes?: string; jiraTicket?: string }): Session {
     const metrics = this.computeMetrics(raw.messages);
 
     if (raw.linesAdded !== undefined) { metrics.linesAdded = raw.linesAdded; }
@@ -148,6 +162,12 @@ export class SessionManager {
       branches.unshift(raw.gitBranch);
     }
 
+    const tags = overlay?.tags ?? [];
+    const explicitTicket = overlay?.jiraTicket?.trim();
+    const jiraTicket = explicitTicket && explicitTicket.length > 0
+      ? explicitTicket
+      : this.detectJiraTicket(tags, overlay?.customName, raw.title);
+
     return {
       id: raw.id,
       autoTitle: raw.title,
@@ -157,17 +177,31 @@ export class SessionManager {
       lastMessageAt: raw.lastMessageAt,
 
       customName: overlay?.customName,
-      tags: overlay?.tags ?? [],
+      tags,
       pinned: overlay?.pinned ?? false,
       status: overlay?.status ?? 'none',
       groupId: overlay?.groupId,
       relatedSessionIds: overlay?.relatedSessionIds ?? [],
       branches,
       notes: overlay?.notes,
+      jiraTicket,
       workspacePath: raw.workspacePath,
 
       metrics,
     };
+  }
+
+  private detectJiraTicket(tags: string[], customName?: string, autoTitle?: string): string | undefined {
+    for (const tag of tags) {
+      const m = tag.toUpperCase().match(JIRA_TICKET_REGEX);
+      if (m) { return m[1]; }
+    }
+    for (const candidate of [customName, autoTitle]) {
+      if (!candidate) { continue; }
+      const m = candidate.toUpperCase().match(JIRA_TICKET_REGEX);
+      if (m) { return m[1]; }
+    }
+    return undefined;
   }
 
   private computeMetrics(messages: CursorRawMessage[]): SessionMetrics {
@@ -213,7 +247,15 @@ export class SessionManager {
 
       if (filter.searchQuery) {
         const q = filter.searchQuery.toLowerCase();
-        const haystack = [s.displayName, ...s.tags, ...s.branches].join(' ').toLowerCase();
+        const haystack = [
+          s.displayName,
+          s.autoTitle,
+          s.notes ?? '',
+          s.jiraTicket ?? '',
+          ...s.tags,
+          ...s.branches,
+          ...s.messages.map(m => m.content),
+        ].join(' ').toLowerCase();
         if (!haystack.includes(q)) { return false; }
       }
 

@@ -4,6 +4,7 @@ import { OverlayStore } from '../services/overlayStore';
 import { openSession, openSessionAsDocument } from '../services/sessionOpener';
 import { Session } from '../models/types';
 import { log } from '../services/logger';
+import { configureJiraBaseUrl, getJiraBaseUrl, openJiraTicket } from '../services/jiraLinker';
 
 export class SessionSidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'cursorSessions.sidebar';
@@ -52,7 +53,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           await this.sendRefresh();
           break;
         case 'search':
-          await this.handleSearch(msg.query);
+          await this.handleSearch(msg.query, msg.scope);
           break;
         case 'pin':
           await this.overlay.setPin(msg.sessionId, msg.pinned);
@@ -100,11 +101,41 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'deleteSession':
           await this.handleDeleteSession(msg.sessionId);
           break;
+        case 'deleteSessions':
+          await this.handleDeleteMultiple(msg.sessionIds);
+          break;
         case 'restoreDeleted':
           await this.handleRestoreDeleted();
           break;
+        case 'setJiraTicket':
+          await this.handleSetJiraTicket(msg.sessionId);
+          break;
+        case 'clearJiraTicket':
+          if (typeof msg.sessionId === 'string' && msg.sessionId.length > 0) {
+            await this.overlay.setJiraTicket(msg.sessionId, undefined);
+          }
+          break;
+        case 'openJira':
+          await openJiraTicket(msg.ticket);
+          break;
+        case 'openJiraSettings':
+          await configureJiraBaseUrl();
+          break;
       }
     });
+
+    this.configDisposable?.dispose();
+    this.configDisposable = vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('cursorSessions.jiraBaseUrl')) {
+        void this.sendRefresh();
+      }
+    });
+  }
+
+  private configDisposable?: vscode.Disposable;
+
+  dispose(): void {
+    this.configDisposable?.dispose();
   }
 
   private async sendRefresh(): Promise<void> {
@@ -128,6 +159,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         workspaceOnly: this.currentWorkspaceOnly,
         hasWorkspace: !!wsPath,
         hiddenCount,
+        jiraBaseUrl: getJiraBaseUrl(),
       });
       log.info('sendRefresh: done');
     } catch (err) {
@@ -136,11 +168,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleSearch(query: string): Promise<void> {
+  private async handleSearch(query: string, scope?: unknown): Promise<void> {
     if (!this.view) { return; }
-    const results = await this.sessionManager.searchSessions(query);
+    const normalizedScope: 'title' | 'all' = scope === 'title' ? 'title' : 'all';
+    const results = await this.sessionManager.searchSessions(query, normalizedScope);
     const tags = this.sessionManager.getAllTags();
-    this.view.webview.postMessage({ type: 'sessions', sessions: results, tags, groups: [] });
+    this.view.webview.postMessage({
+      type: 'sessions',
+      sessions: results,
+      tags,
+      groups: [],
+      jiraBaseUrl: getJiraBaseUrl(),
+    });
   }
 
   private async handleRename(sessionId: string): Promise<void> {
@@ -279,6 +318,45 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async handleDeleteMultiple(sessionIds: string[]): Promise<void> {
+    const ids = Array.isArray(sessionIds)
+      ? sessionIds.filter(id => typeof id === 'string' && id.length > 0)
+      : [];
+    if (ids.length === 0) { return; }
+    const answer = await vscode.window.showWarningMessage(
+      `Delete ${ids.length} session(s) from your list?`,
+      {
+        modal: true,
+        detail: 'You can restore them later via Command Palette > "Sessions: Restore Deleted Sessions".',
+      },
+      'Delete',
+    );
+    if (answer !== 'Delete') { return; }
+    const count = await this.overlay.hideSessions(ids);
+    this.sessionManager.invalidateCache();
+    await this.sendRefresh();
+    vscode.window.showInformationMessage(`Deleted ${count} session(s).`);
+  }
+
+  private async handleSetJiraTicket(sessionId: string): Promise<void> {
+    const session = await this.sessionManager.getSession(sessionId);
+    const current = session?.jiraTicket ?? '';
+    const ticket = await vscode.window.showInputBox({
+      prompt: 'Enter JIRA ticket key (leave blank to unset)',
+      placeHolder: 'e.g., AISTUDIO-1234',
+      value: current,
+      validateInput: (val) => {
+        const trimmed = val.trim();
+        if (!trimmed) { return undefined; }
+        return /^[A-Za-z][A-Za-z0-9]+-\d+$/.test(trimmed)
+          ? undefined
+          : 'Expected format like PROJ-1234';
+      },
+    });
+    if (ticket === undefined) { return; }
+    await this.overlay.setJiraTicket(sessionId, ticket.trim() || undefined);
+  }
+
   private async handleRestoreDeleted(): Promise<void> {
     const count = this.overlay.getHiddenCount();
     if (count === 0) { return; }
@@ -300,7 +378,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     });
     const tags = this.sessionManager.getAllTags();
     if (this.view) {
-      this.view.webview.postMessage({ type: 'sessions', sessions, tags, groups: [], activeFilter: tag });
+      this.view.webview.postMessage({
+        type: 'sessions',
+        sessions,
+        tags,
+        groups: [],
+        activeFilter: tag,
+        jiraBaseUrl: getJiraBaseUrl(),
+      });
     }
   }
 
@@ -384,21 +469,28 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       gap: 4px;
       align-items: center;
     }
-    .search-input {
-      flex: 1;
-      background: var(--input-bg);
-      color: var(--input-fg);
-      border: 1px solid var(--input-border);
-      border-radius: 4px;
-      padding: 5px 8px 5px 26px;
-      font-size: 12px;
-      outline: none;
-      transition: border-color 0.15s;
-    }
-    .search-input:focus { border-color: var(--focus); }
     .search-wrap {
       flex: 1;
       position: relative;
+      display: flex;
+      align-items: stretch;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: 4px;
+      transition: border-color 0.15s;
+      overflow: hidden;
+      min-width: 0;
+    }
+    .search-wrap:focus-within { border-color: var(--focus); }
+    .search-input {
+      flex: 1;
+      min-width: 0;
+      background: transparent;
+      color: var(--input-fg);
+      border: none;
+      padding: 5px 6px 5px 26px;
+      font-size: 12px;
+      outline: none;
     }
     .search-icon {
       position: absolute;
@@ -409,6 +501,33 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       color: var(--dim);
       pointer-events: none;
     }
+    .scope-seg {
+      display: inline-flex;
+      align-items: stretch;
+      border-left: 1px solid var(--input-border);
+      flex-shrink: 0;
+    }
+    .scope-seg-btn {
+      background: none;
+      border: none;
+      padding: 0 8px;
+      font-size: 10px;
+      font-family: inherit;
+      color: var(--dim);
+      cursor: pointer;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      transition: background 0.15s, color 0.15s;
+      white-space: nowrap;
+    }
+    .scope-seg-btn + .scope-seg-btn { border-left: 1px solid var(--input-border); }
+    .scope-seg-btn:hover { color: var(--fg); background: var(--hover-bg); }
+    .scope-seg-btn.active {
+      color: var(--success);
+      background: rgba(78,201,176,0.14);
+      font-weight: 600;
+    }
+    .scope-seg-btn:focus-visible { outline: 1px solid var(--focus); outline-offset: -1px; }
     .icon-btn {
       background: none;
       border: none;
@@ -768,6 +887,124 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       background: rgba(78,201,176,0.25);
     }
 
+    /* --- Select mode --- */
+    .select-bar {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      background: rgba(79,193,255,0.08);
+      border: 1px solid rgba(79,193,255,0.3);
+      border-radius: 4px;
+      font-size: 11.5px;
+      color: var(--fg);
+    }
+    .select-bar.active { display: flex; }
+    .select-bar .select-count { font-weight: 600; }
+    .select-bar .spacer { flex: 1; }
+    .select-bar button {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--fg);
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .select-bar button:hover { background: var(--hover-bg); }
+    .select-bar button.primary-danger {
+      background: rgba(241,76,76,0.1);
+      color: var(--error);
+      border-color: rgba(241,76,76,0.4);
+    }
+    .select-bar button.primary-danger:hover {
+      background: rgba(241,76,76,0.18);
+    }
+    .select-bar button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .session-card.selectable { padding-left: 32px; }
+    .session-card.selected {
+      background: rgba(79,193,255,0.08);
+      border-left-color: var(--link);
+    }
+    .session-checkbox {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      width: 14px;
+      height: 14px;
+      border: 1.5px solid var(--dim);
+      border-radius: 3px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      font-size: 10px;
+      color: var(--link);
+      font-weight: 700;
+      line-height: 1;
+    }
+    body.select-mode .session-checkbox { display: flex; }
+    body.select-mode .session-card { cursor: pointer; }
+    body.select-mode .session-card .pin-toggle,
+    body.select-mode .session-card .card-actions,
+    body.select-mode .session-card .status-badge,
+    body.select-mode .session-card .tag-remove,
+    body.select-mode .session-card .branch-remove,
+    body.select-mode .session-card .jira-badge {
+      pointer-events: none;
+    }
+    body.select-mode .session-card .card-actions { display: none !important; }
+    .session-card.selected .session-checkbox {
+      background: var(--link);
+      border-color: var(--link);
+      color: var(--bg);
+    }
+
+    /* --- JIRA / created date row --- */
+    .card-info {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-top: 5px;
+      font-size: 10.5px;
+      color: var(--dim);
+    }
+    .jira-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(79,193,255,0.12);
+      color: var(--link);
+      border: 1px solid rgba(79,193,255,0.25);
+      padding: 2px 7px;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 10px;
+      letter-spacing: 0.2px;
+      cursor: pointer;
+      transition: all 0.12s;
+      text-decoration: none;
+    }
+    .jira-badge:hover { background: rgba(79,193,255,0.22); }
+    .jira-badge.disabled {
+      cursor: help;
+      opacity: 0.85;
+    }
+    .jira-badge .jira-icon { font-size: 9px; opacity: 0.85; }
+    .created-on {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      opacity: 0.85;
+    }
+
     /* --- Detail panel --- */
     .detail-panel { display: none; padding: 0; overflow-y: auto; }
     .detail-panel.active { display: block; animation: fadeIn 0.2s ease-out; }
@@ -908,6 +1145,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       <div class="search-wrap">
         <span class="search-icon">&#x1F50D;</span>
         <input class="search-input" id="searchInput" type="text" placeholder="Search sessions..." aria-label="Search sessions" />
+        <div class="scope-seg" role="group" aria-label="Search scope">
+          <button class="scope-seg-btn" id="scopeTitleBtn" type="button" aria-pressed="false" title="Match only session names, tags, notes, branches, and JIRA keys">Title</button>
+          <button class="scope-seg-btn active" id="scopeAllBtn" type="button" aria-pressed="true" title="Also match inside chat message content">+ Chat</button>
+        </div>
       </div>
       <select class="sort-select" id="sortSelect" title="Sort by">
         <option value="lastMessageAt">Recent</option>
@@ -919,8 +1160,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     </div>
     <div class="toolbar-row">
       <button class="toggle-btn" id="wsToggle" title="Show only sessions from the current workspace">This Workspace</button>
+      <button class="toggle-btn" id="selectToggle" title="Select multiple sessions to delete">Select</button>
     </div>
     <div id="counterRow" class="counter-row"></div>
+    <div class="select-bar" id="selectBar">
+      <span class="select-count" id="selectCount">0 selected</span>
+      <span class="spacer"></span>
+      <button id="selectAllBtn" title="Select all visible sessions">Select all</button>
+      <button id="deleteSelectedBtn" class="primary-danger" disabled>Delete</button>
+      <button id="cancelSelectBtn" title="Exit selection mode">Cancel</button>
+    </div>
     <div class="tag-bar" id="tagBar"></div>
     <div class="filter-banner" id="filterBanner">
       <span>Filtered by:</span>
@@ -960,6 +1209,9 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     let allSessions = [];
     let activeFilter = null;
     let currentSort = 'lastMessageAt';
+    let jiraBaseUrl = '';
+    let selectMode = false;
+    const selectedIds = new Set();
 
     const STATUS_LABELS = {
       none:'', todo:'TODO', in_progress:'In Progress', pr_created:'PR Created',
@@ -990,11 +1242,91 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     const restoreBanner = $('restoreBanner');
     const restoreText = $('restoreText');
     const restoreBtn = $('restoreBtn');
+    const selectToggle = $('selectToggle');
+    const selectBar = $('selectBar');
+    const selectCount = $('selectCount');
+    const selectAllBtn = $('selectAllBtn');
+    const deleteSelectedBtn = $('deleteSelectedBtn');
+    const cancelSelectBtn = $('cancelSelectBtn');
+    const scopeTitleBtn = $('scopeTitleBtn');
+    const scopeAllBtn = $('scopeAllBtn');
     let wsOnly = false;
+
+    const persisted = (typeof vscode.getState === 'function' ? vscode.getState() : null) || {};
+    let searchScope = persisted.searchScope === 'title' ? 'title' : 'all';
+    applyScopeUI();
+
+    function applyScopeUI() {
+      const titleOnly = searchScope === 'title';
+      scopeTitleBtn.classList.toggle('active', titleOnly);
+      scopeAllBtn.classList.toggle('active', !titleOnly);
+      scopeTitleBtn.setAttribute('aria-pressed', String(titleOnly));
+      scopeAllBtn.setAttribute('aria-pressed', String(!titleOnly));
+    }
+
+    function persistScope() {
+      if (typeof vscode.setState !== 'function') { return; }
+      const prev = (typeof vscode.getState === 'function' ? vscode.getState() : null) || {};
+      vscode.setState({ ...prev, searchScope });
+    }
+
+    function setScope(next) {
+      if (next !== 'title' && next !== 'all') { return; }
+      if (next === searchScope) { return; }
+      searchScope = next;
+      applyScopeUI();
+      persistScope();
+      if (searchInput.value.trim().length > 0) {
+        vscode.postMessage({ type: 'search', query: searchInput.value, scope: searchScope });
+      }
+    }
+
+    scopeTitleBtn.addEventListener('click', () => setScope('title'));
+    scopeAllBtn.addEventListener('click', () => setScope('all'));
 
     restoreBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'restoreDeleted' });
     });
+
+    selectToggle.addEventListener('click', () => {
+      setSelectMode(!selectMode);
+    });
+    cancelSelectBtn.addEventListener('click', () => {
+      setSelectMode(false);
+    });
+    selectAllBtn.addEventListener('click', () => {
+      const anyUnselected = allSessions.some(s => !selectedIds.has(s.id));
+      if (anyUnselected) {
+        for (const s of allSessions) { selectedIds.add(s.id); }
+      } else {
+        selectedIds.clear();
+      }
+      renderSessions(allSessions);
+      updateSelectBar();
+    });
+    deleteSelectedBtn.addEventListener('click', () => {
+      if (selectedIds.size === 0) { return; }
+      vscode.postMessage({ type: 'deleteSessions', sessionIds: [...selectedIds] });
+      // The backend prompts for confirmation and clears selection mode on success via refresh.
+      setSelectMode(false);
+    });
+
+    function setSelectMode(enabled) {
+      selectMode = !!enabled;
+      selectedIds.clear();
+      document.body.classList.toggle('select-mode', selectMode);
+      selectBar.classList.toggle('active', selectMode);
+      selectToggle.classList.toggle('active', selectMode);
+      renderSessions(allSessions);
+      updateSelectBar();
+    }
+
+    function updateSelectBar() {
+      const count = selectedIds.size;
+      selectCount.textContent = count + ' selected';
+      deleteSelectedBtn.disabled = count === 0;
+      deleteSelectedBtn.textContent = count > 0 ? 'Delete ' + count : 'Delete';
+    }
 
     wsToggle.addEventListener('click', () => {
       wsOnly = !wsOnly;
@@ -1006,7 +1338,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     searchInput.addEventListener('input', () => {
       clearTimeout(searchTimeout);
       searchTimeout = setTimeout(() => {
-        vscode.postMessage({ type: 'search', query: searchInput.value });
+        vscode.postMessage({ type: 'search', query: searchInput.value, scope: searchScope });
       }, 200);
     });
 
@@ -1053,9 +1385,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         loadingState.style.display = 'none';
         refreshBtn.classList.remove('spinning');
         allSessions = msg.sessions || [];
+        if (typeof msg.jiraBaseUrl === 'string') {
+          jiraBaseUrl = msg.jiraBaseUrl;
+        }
+        // Drop stale selection ids that were just deleted / hidden.
+        const visibleIds = new Set(allSessions.map(s => s.id));
+        for (const id of [...selectedIds]) {
+          if (!visibleIds.has(id)) { selectedIds.delete(id); }
+        }
         renderTags(msg.tags || []);
         renderCounter(allSessions);
         renderSessions(allSessions);
+        updateSelectBar();
         if (msg.workspaceOnly !== undefined) {
           wsOnly = msg.workspaceOnly;
           wsToggle.classList.toggle('active', wsOnly);
@@ -1172,10 +1513,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
     function createSessionCard(session) {
       const el = document.createElement('div');
-      el.className = 'session-card' + (session.pinned ? ' pinned' : '');
+      const isSelected = selectedIds.has(session.id);
+      el.className = 'session-card' +
+        (session.pinned ? ' pinned' : '') +
+        (selectMode ? ' selectable' : '') +
+        (isSelected ? ' selected' : '');
       el.setAttribute('tabindex', '0');
       el.setAttribute('role', 'listitem');
       el.setAttribute('aria-label', session.displayName || 'Session');
+      el.setAttribute('data-session-id', session.id);
+      if (selectMode) { el.setAttribute('aria-pressed', String(isSelected)); }
 
       const safeId = escapeHtml(session.id);
       const pinSymbol = session.pinned ? '&#x1F4CC;' : '&#x25CB;';
@@ -1202,7 +1549,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const statusLabel = STATUS_LABELS[status] || '';
       const statusColor = STATUS_COLORS[status] || '';
 
+      // Info line: created date + JIRA ticket (fills space below the status row).
+      const createdText = session.createdAt ? formatAbsoluteDate(session.createdAt) : '';
+      const jiraBadgeHtml = buildJiraBadge(session.jiraTicket);
+      const infoHtml = (createdText || jiraBadgeHtml)
+        ? '<div class="card-info">' +
+            (createdText ? '<span class="created-on" title="Session created">&#x1F4C5; Created ' + escapeHtml(createdText) + '</span>' : '') +
+            jiraBadgeHtml +
+          '</div>'
+        : '';
+
       el.innerHTML =
+        '<span class="session-checkbox" aria-hidden="true">' + (isSelected ? '&#x2713;' : '') + '</span>' +
         '<div class="card-header">' +
           '<span class="card-title">' + escapeHtml(session.displayName) + '</span>' +
           (statusLabel ? '<button class="status-badge" data-action="setStatus" data-id="' + safeId + '" style="background:' + statusColor + '22;color:' + statusColor + ';"><span class="status-dot" style="background:' + statusColor + ';"></span>' + escapeHtml(statusLabel) + '</button>' : '') +
@@ -1216,6 +1574,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
             '<span class="meta-item">' + escapeHtml(p) + '</span>'
           ).join('') +
         '</div>' +
+        infoHtml +
         (session.branches && session.branches.length > 0 ?
           '<div class="card-branches">' +
             session.branches.map(b =>
@@ -1241,13 +1600,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           '<button class="act-btn" data-action="tag" data-id="' + safeId + '">Tag</button>' +
           '<button class="act-btn" data-action="addBranch" data-id="' + safeId + '">Branch</button>' +
           '<button class="act-btn" data-action="setStatus" data-id="' + safeId + '">Status</button>' +
+          '<button class="act-btn" data-action="setJiraTicket" data-id="' + safeId + '">' + (session.jiraTicket ? 'JIRA: ' + escapeHtml(session.jiraTicket) : 'JIRA') + '</button>' +
           '<button class="act-btn" data-action="export" data-id="' + safeId + '">Export</button>' +
           '<button class="act-btn danger" data-action="deleteSession" data-id="' + safeId + '">Delete</button>' +
         '</div>';
 
-      function handleCardAction(target) {
-        const action = target.dataset?.action;
-        const id = target.dataset?.id || session.id;
+      function handleCardAction(rawTarget) {
+        // Walk up to the nearest element that declares an action so clicks on
+        // nested icons/labels (e.g. the emoji inside a JIRA badge) still route
+        // to the right handler.
+        const target = rawTarget?.closest?.('[data-action]') || rawTarget;
+        const action = target?.dataset?.action;
+        const id = target?.dataset?.id || session.id;
 
         if (action === 'pin') {
           vscode.postMessage({ type: 'pin', sessionId: id, pinned: !session.pinned });
@@ -1277,6 +1641,13 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           vscode.postMessage({ type: 'export', sessionId: id, format: 'markdown' });
         } else if (action === 'deleteSession') {
           vscode.postMessage({ type: 'deleteSession', sessionId: id });
+        } else if (action === 'openJira') {
+          const ticket = target.dataset?.ticket;
+          if (ticket) { vscode.postMessage({ type: 'openJira', ticket }); }
+        } else if (action === 'openJiraSettings') {
+          vscode.postMessage({ type: 'openJiraSettings' });
+        } else if (action === 'setJiraTicket') {
+          vscode.postMessage({ type: 'setJiraTicket', sessionId: id });
         } else if (action === 'filterTag') {
           const tag = target.dataset?.tag;
           if (tag) {
@@ -1290,8 +1661,21 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      el.addEventListener('click', (e) => handleCardAction(e.target));
+      el.addEventListener('click', (e) => {
+        if (selectMode) {
+          e.preventDefault();
+          e.stopPropagation();
+          toggleSelection(session.id);
+          return;
+        }
+        handleCardAction(e.target);
+      });
       el.addEventListener('keydown', (e) => {
+        if (selectMode && (e.key === 'Enter' || e.key === ' ')) {
+          e.preventDefault();
+          toggleSelection(session.id);
+          return;
+        }
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           vscode.postMessage({ type: 'openSession', sessionId: session.id });
@@ -1371,6 +1755,23 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           (dStatusLabel ? '<span class="status-dot" style="background:' + dStatusColor + ';"></span>' + escapeHtml(dStatusLabel) : 'Set status...') +
         '</button></div>';
 
+      const createdText = session.createdAt ? formatAbsoluteDate(session.createdAt) : '';
+      const lastActiveText = session.lastMessageAt ? formatAbsoluteDate(session.lastMessageAt) : '';
+      if (createdText || lastActiveText) {
+        html += '<div class="detail-section"><h4>Timeline</h4><div class="card-info">' +
+          (createdText ? '<span class="created-on">&#x1F4C5; Created ' + escapeHtml(createdText) + '</span>' : '') +
+          (lastActiveText ? '<span class="created-on">&#x1F550; Last active ' + escapeHtml(lastActiveText) + '</span>' : '') +
+          '</div></div>';
+      }
+
+      html += '<div class="detail-section"><h4>JIRA</h4><div class="card-info">' +
+        (session.jiraTicket
+          ? buildJiraBadge(session.jiraTicket) +
+            ' <button class="act-btn" id="dSetJira" style="font-size:10px;padding:2px 8px;">Change</button>' +
+            ' <button class="act-btn" id="dClearJira" style="font-size:10px;padding:2px 8px;">Clear</button>'
+          : '<button class="act-btn" id="dSetJira" style="font-size:10px;padding:2px 8px;">+ Link ticket</button>') +
+        '</div></div>';
+
       if (session.tags.length > 0) {
         html += '<div class="detail-section"><h4>Tags</h4><div class="card-tags">' +
           session.tags.map(t =>
@@ -1420,6 +1821,26 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
       $('dSetStatus')?.addEventListener('click', () => {
         vscode.postMessage({ type: 'setStatus', sessionId: session.id });
+      });
+
+      $('dSetJira')?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'setJiraTicket', sessionId: session.id });
+      });
+      $('dClearJira')?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'clearJiraTicket', sessionId: session.id });
+      });
+      $('detailBody').querySelectorAll('.jira-badge').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const action = el.dataset?.action;
+          if (action === 'openJira') {
+            const ticket = el.dataset?.ticket;
+            if (ticket) { vscode.postMessage({ type: 'openJira', ticket }); }
+          } else if (action === 'openJiraSettings') {
+            vscode.postMessage({ type: 'openJiraSettings' });
+          }
+        });
       });
 
       $('detailBody').querySelectorAll('.tag-remove').forEach(el => {
@@ -1502,6 +1923,53 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       if (days < 7) return days + 'd ago';
       if (days < 30) return Math.floor(days / 7) + 'w ago';
       return new Date(ts).toLocaleDateString();
+    }
+
+    function formatAbsoluteDate(ts) {
+      if (!ts) return '';
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return '';
+      const now = new Date();
+      const sameYear = d.getFullYear() === now.getFullYear();
+      const opts = sameYear
+        ? { month: 'short', day: 'numeric' }
+        : { month: 'short', day: 'numeric', year: 'numeric' };
+      return d.toLocaleDateString(undefined, opts);
+    }
+
+    function toggleSelection(id) {
+      if (selectedIds.has(id)) {
+        selectedIds.delete(id);
+      } else {
+        selectedIds.add(id);
+      }
+      const card = sessionList.querySelector('[data-session-id="' + cssEscape(id) + '"]');
+      if (card) {
+        const selected = selectedIds.has(id);
+        card.classList.toggle('selected', selected);
+        card.setAttribute('aria-pressed', String(selected));
+        const cb = card.querySelector('.session-checkbox');
+        if (cb) { cb.innerHTML = selected ? '&#x2713;' : ''; }
+      }
+      updateSelectBar();
+    }
+
+    function cssEscape(value) {
+      if (typeof CSS !== 'undefined' && CSS.escape) { return CSS.escape(value); }
+      return String(value).replace(/[^a-zA-Z0-9_-]/g, ch => '\\\\' + ch);
+    }
+
+    function buildJiraBadge(ticket) {
+      if (!ticket) return '';
+      const safe = escapeHtml(ticket);
+      if (jiraBaseUrl) {
+        return '<a class="jira-badge" data-action="openJira" data-ticket="' + safe + '" title="Open ' + safe + ' in JIRA">' +
+          '<span class="jira-icon">&#x1F517;</span>' + safe +
+        '</a>';
+      }
+      return '<a class="jira-badge disabled" data-action="openJiraSettings" title="Click to set your JIRA base URL and enable ticket links">' +
+        '<span class="jira-icon">&#x1F517;</span>' + safe +
+      '</a>';
     }
 
     function escapeHtml(str) {
