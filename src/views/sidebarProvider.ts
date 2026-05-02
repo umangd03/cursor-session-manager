@@ -535,7 +535,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
       padding: 5px;
       border-radius: 4px;
-      font-size: 13px;
+      font-size: 16px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -943,7 +943,8 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     }
     .session-checkbox {
       position: absolute;
-      top: 10px;
+      top: 50%;
+      transform: translateY(-50%);
       left: 10px;
       width: 14px;
       height: 14px;
@@ -959,7 +960,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       line-height: 1;
     }
     body.select-mode .session-checkbox { display: flex; }
-    body.select-mode .session-card { cursor: pointer; }
+    body.select-mode .session-card { 
+      cursor: pointer; 
+      padding-left: 32px !important;
+    }
     body.select-mode .session-card .pin-toggle,
     body.select-mode .session-card .card-actions,
     body.select-mode .session-card .status-badge,
