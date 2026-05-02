@@ -586,7 +586,15 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     .counter-row span { display: flex; align-items: center; gap: 3px; }
 
     /* --- Tag bar --- */
-    .tag-bar { display: flex; flex-wrap: wrap; gap: 4px; }
+    .tag-bar { 
+      display: flex; 
+      flex-wrap: nowrap; 
+      gap: 4px; 
+      overflow-x: auto; 
+      padding-bottom: 4px; 
+      scrollbar-width: none; /* Firefox */
+    }
+    .tag-bar::-webkit-scrollbar { display: none; } /* Chrome/Safari */
     .tag-chip {
       background: var(--badge-bg);
       color: var(--badge-fg);
@@ -816,10 +824,11 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       align-items: center;
       gap: 3px;
       font-size: 10px;
-      color: var(--success);
-      background: rgba(78,201,176,0.08);
-      padding: 1px 6px;
+      color: var(--dim);
+      background: none;
+      padding: 1px 4px;
       border-radius: 3px;
+      border: 1px solid var(--border);
       max-width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -980,24 +989,21 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       display: inline-flex;
       align-items: center;
       gap: 4px;
-      background: rgba(79,193,255,0.12);
       color: var(--link);
-      border: 1px solid rgba(79,193,255,0.25);
-      padding: 2px 7px;
-      border-radius: 3px;
-      font-weight: 600;
-      font-size: 10px;
-      letter-spacing: 0.2px;
+      background: none;
+      padding: 0;
+      font-weight: 500;
+      font-size: 10.5px;
       cursor: pointer;
       transition: all 0.12s;
       text-decoration: none;
     }
-    .jira-badge:hover { background: rgba(79,193,255,0.22); }
+    .jira-badge:hover { text-decoration: underline; }
     .jira-badge.disabled {
       cursor: help;
       opacity: 0.85;
     }
-    .jira-badge .jira-icon { font-size: 9px; opacity: 0.85; }
+    .jira-badge .jira-icon { font-size: 10px; opacity: 0.85; }
     .created-on {
       display: inline-flex;
       align-items: center;
@@ -1018,7 +1024,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       z-index: 5;
     }
     .detail-back {
-      font-size: 11px;
+      font-size: 12px;
       color: var(--link);
       cursor: pointer;
       background: none;
@@ -1026,8 +1032,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       gap: 4px;
-      margin-bottom: 8px;
+      margin-bottom: 12px;
       font-family: inherit;
+      font-weight: 500;
+      padding: 4px 0;
     }
     .detail-back:hover { text-decoration: underline; }
     .detail-title-row { display: flex; align-items: center; gap: 8px; }
@@ -1103,6 +1111,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
       position: relative;
       word-break: break-word;
+      max-width: 90%;
     }
     .msg-bubble::after {
       content: '';
@@ -1117,10 +1126,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     .msg-bubble.user {
       background: rgba(128,128,128,0.08);
       border-left: 2px solid var(--link);
+      align-self: flex-end;
+      border-radius: 8px 8px 0 8px;
     }
     .msg-bubble.assistant {
       background: rgba(78,201,176,0.06);
       border-left: 2px solid var(--success);
+      align-self: flex-start;
+      border-radius: 8px 8px 8px 0;
     }
     .msg-label {
       font-size: 10px;
@@ -1150,19 +1163,23 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           <button class="scope-seg-btn active" id="scopeAllBtn" type="button" aria-pressed="true" title="Also match inside chat message content">+ Chat</button>
         </div>
       </div>
-      <select class="sort-select" id="sortSelect" title="Sort by">
-        <option value="lastMessageAt">Recent</option>
-        <option value="createdAt">Created</option>
-        <option value="displayName">Name</option>
-        <option value="messageCount">Messages</option>
-      </select>
-      <button class="icon-btn" id="refreshBtn" title="Refresh">&#x21BB;</button>
     </div>
-    <div class="toolbar-row">
-      <button class="toggle-btn" id="wsToggle" title="Show only sessions from the current workspace">This Workspace</button>
-      <button class="toggle-btn" id="selectToggle" title="Select multiple sessions to delete">Select</button>
+    <div class="toolbar-row" style="justify-content: space-between;">
+      <div style="display: flex; gap: 4px;">
+        <button class="toggle-btn" id="wsToggle" title="Show only sessions from the current workspace">&#x1F4C1; Workspace</button>
+        <button class="toggle-btn" id="selectToggle" title="Select multiple sessions to delete">&#x2611; Select</button>
+      </div>
+      <div style="display: flex; gap: 4px;">
+        <select class="sort-select" id="sortSelect" title="Sort by">
+          <option value="lastMessageAt">Recent</option>
+          <option value="createdAt">Created</option>
+          <option value="displayName">Name</option>
+          <option value="messageCount">Messages</option>
+        </select>
+        <button class="icon-btn" id="viewToggleBtn" title="Toggle Minimal/Detailed View">&#x2261;</button>
+        <button class="icon-btn" id="refreshBtn" title="Refresh">&#x21BB;</button>
+      </div>
     </div>
-    <div id="counterRow" class="counter-row"></div>
     <div class="select-bar" id="selectBar">
       <span class="select-count" id="selectCount">0 selected</span>
       <span class="spacer"></span>
@@ -1190,6 +1207,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       <span id="restoreText"></span>
       <button class="restore-btn" id="restoreBtn">Restore All</button>
     </div>
+    <div id="counterRow" class="counter-row" style="justify-content: center; padding: 12px 0; border-top: 1px solid var(--border); margin-top: 8px;"></div>
   </div>
 
   <div id="detailView" class="detail-panel">
@@ -1219,9 +1237,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       approved:'Approved', merged:'Merged', done:'Done', abandoned:'Abandoned'
     };
     const STATUS_COLORS = {
-      none:'', todo:'#d7ba7d', in_progress:'#4fc1ff', pr_created:'#cca700',
-      in_review:'#c586c0', changes_requested:'#f14c4c',
-      approved:'#4ec9b0', merged:'#4ec9b0', done:'#6a9955', abandoned:'#808080'
+      none:'', 
+      todo:'var(--vscode-descriptionForeground)', 
+      in_progress:'var(--vscode-terminal-ansiBlue)', 
+      pr_created:'var(--vscode-problemsWarningIcon-foreground)',
+      in_review:'var(--vscode-terminal-ansiMagenta)', 
+      changes_requested:'var(--vscode-errorForeground)',
+      approved:'var(--vscode-testing-iconPassed)', 
+      merged:'var(--vscode-testing-iconPassed)', 
+      done:'var(--vscode-testing-iconPassed)', 
+      abandoned:'var(--vscode-disabledForeground)'
     };
 
     const $ = id => document.getElementById(id);
@@ -1549,32 +1574,25 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const statusLabel = STATUS_LABELS[status] || '';
       const statusColor = STATUS_COLORS[status] || '';
 
-      // Info line: created date + JIRA ticket (fills space below the status row).
       const createdText = session.createdAt ? formatAbsoluteDate(session.createdAt) : '';
       const jiraBadgeHtml = buildJiraBadge(session.jiraTicket);
-      const infoHtml = (createdText || jiraBadgeHtml)
-        ? '<div class="card-info">' +
-            (createdText ? '<span class="created-on" title="Session created">&#x1F4C5; Created ' + escapeHtml(createdText) + '</span>' : '') +
-            jiraBadgeHtml +
-          '</div>'
-        : '';
 
       el.innerHTML =
         '<span class="session-checkbox" aria-hidden="true">' + (isSelected ? '&#x2713;' : '') + '</span>' +
         '<div class="card-header">' +
           '<span class="card-title">' + escapeHtml(session.displayName) + '</span>' +
-          (statusLabel ? '<button class="status-badge" data-action="setStatus" data-id="' + safeId + '" style="background:' + statusColor + '22;color:' + statusColor + ';"><span class="status-dot" style="background:' + statusColor + ';"></span>' + escapeHtml(statusLabel) + '</button>' : '') +
-          (mode ? '<span class="mode-badge ' + escapeHtml(mode) + '">' + escapeHtml(mode) + '</span>' : '') +
+          (statusLabel ? '<button class="status-badge" data-action="setStatus" data-id="' + safeId + '" title="' + escapeHtml(statusLabel) + '" style="padding:2px;background:none;"><span class="status-dot" style="background:' + statusColor + ';"></span></button>' : '') +
           '<span class="pin-toggle" data-action="pin" data-id="' + safeId + '">' + pinSymbol + '</span>' +
         '</div>' +
         (subtitle ? '<div class="card-subtitle">' + escapeHtml(subtitle) + '</div>' : '') +
         '<div class="card-meta">' +
+          (mode ? '<span class="mode-badge ' + escapeHtml(mode) + '">' + escapeHtml(mode) + '</span><span class="meta-dot">&#183;</span>' : '') +
+          (jiraBadgeHtml ? jiraBadgeHtml + '<span class="meta-dot">&#183;</span>' : '') +
           metaParts.map((p, i) =>
             (i > 0 ? '<span class="meta-dot">&#183;</span>' : '') +
             '<span class="meta-item">' + escapeHtml(p) + '</span>'
           ).join('') +
         '</div>' +
-        infoHtml +
         (session.branches && session.branches.length > 0 ?
           '<div class="card-branches">' +
             session.branches.map(b =>
@@ -1750,7 +1768,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const dStatusColor = STATUS_COLORS[dStatus] || '';
       html += '<div class="detail-section"><h4>Status</h4>' +
         '<button class="status-badge" id="dSetStatus" style="' +
-          (dStatusLabel ? 'background:' + dStatusColor + '22;color:' + dStatusColor + ';' : 'background:rgba(128,128,128,0.1);color:var(--dim);') +
+          (dStatusLabel ? 'background:color-mix(in srgb, ' + dStatusColor + ' 15%, transparent);color:' + dStatusColor + ';' : 'background:rgba(128,128,128,0.1);color:var(--dim);') +
         '">' +
           (dStatusLabel ? '<span class="status-dot" style="background:' + dStatusColor + ';"></span>' + escapeHtml(dStatusLabel) : 'Set status...') +
         '</button></div>';
