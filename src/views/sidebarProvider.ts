@@ -1279,7 +1279,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
     const persisted = (typeof vscode.getState === 'function' ? vscode.getState() : null) || {};
     let searchScope = persisted.searchScope === 'title' ? 'title' : 'all';
+    let minimalView = persisted.minimalView === true;
+    
     applyScopeUI();
+    applyViewUI();
 
     function applyScopeUI() {
       const titleOnly = searchScope === 'title';
@@ -1289,10 +1292,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       scopeAllBtn.setAttribute('aria-pressed', String(!titleOnly));
     }
 
-    function persistScope() {
+    function applyViewUI() {
+      document.body.classList.toggle('minimal-mode', minimalView);
+      viewToggleBtn.innerHTML = minimalView ? '&#x229F;' : '&#x2261;'; // Change icon based on mode
+      viewToggleBtn.title = minimalView ? 'Switch to Detailed View' : 'Switch to Minimal View';
+    }
+
+    function persistState() {
       if (typeof vscode.setState !== 'function') { return; }
       const prev = (typeof vscode.getState === 'function' ? vscode.getState() : null) || {};
-      vscode.setState({ ...prev, searchScope });
+      vscode.setState({ ...prev, searchScope, minimalView });
     }
 
     function setScope(next) {
@@ -1300,11 +1309,17 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       if (next === searchScope) { return; }
       searchScope = next;
       applyScopeUI();
-      persistScope();
+      persistState();
       if (searchInput.value.trim().length > 0) {
         vscode.postMessage({ type: 'search', query: searchInput.value, scope: searchScope });
       }
     }
+
+    viewToggleBtn.addEventListener('click', () => {
+      minimalView = !minimalView;
+      applyViewUI();
+      persistState();
+    });
 
     scopeTitleBtn.addEventListener('click', () => setScope('title'));
     scopeAllBtn.addEventListener('click', () => setScope('all'));
