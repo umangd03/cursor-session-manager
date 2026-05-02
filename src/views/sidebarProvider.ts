@@ -975,6 +975,25 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       color: var(--bg);
     }
 
+    /* --- Minimal Mode --- */
+    body.minimal-mode .card-subtitle,
+    body.minimal-mode .card-meta,
+    body.minimal-mode .card-info,
+    body.minimal-mode .card-branches,
+    body.minimal-mode .card-tags {
+      display: none !important;
+    }
+    body.minimal-mode .session-card {
+      padding: 4px 8px;
+    }
+    body.minimal-mode .card-header {
+      min-height: auto;
+    }
+    body.minimal-mode .card-actions {
+      margin-top: 4px;
+      padding-top: 4px;
+    }
+
     /* --- JIRA / created date row --- */
     .card-info {
       display: flex;
