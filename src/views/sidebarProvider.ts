@@ -151,6 +151,19 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'todoQuickCreateForSession':
           await this.handleTodoQuickCreateForSession(msg.sessionId);
           break;
+        case 'todoSetWebexLink':
+          await this.handleTodoSetWebexLink(msg.todoId);
+          break;
+        case 'todoClearWebexLink':
+          if (typeof msg.todoId === 'string' && msg.todoId.length > 0) {
+            await this.overlay.updateTodo(msg.todoId, { webexLink: '' });
+          }
+          break;
+        case 'todoOpenWebexLink':
+          if (typeof msg.url === 'string' && msg.url.length > 0) {
+            await vscode.env.openExternal(vscode.Uri.parse(msg.url));
+          }
+          break;
         case 'attachSessionToTodo':
           await this.handleAttachSessionToTodo(msg.sessionId);
           break;
@@ -378,6 +391,32 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     });
     if (!title?.trim()) { return; }
     await this.overlay.createTodo(title.trim(), undefined, sid ? [sid] : []);
+  }
+
+  private async handleTodoSetWebexLink(todoId: unknown): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    const todo = this.overlay.getTodo(todoId);
+    if (!todo) { return; }
+    const url = await vscode.window.showInputBox({
+      prompt: 'Webex meeting link',
+      placeHolder: 'https://your-org.webex.com/meet/...',
+      value: todo.webexLink ?? '',
+      validateInput: (v) => {
+        const trimmed = v.trim();
+        if (!trimmed) { return null; }
+        try {
+          const parsed = new URL(trimmed);
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return 'Link must use http:// or https://';
+          }
+        } catch {
+          return 'Enter a valid URL';
+        }
+        return null;
+      },
+    });
+    if (url === undefined) { return; }
+    await this.overlay.updateTodo(todoId, { webexLink: url });
   }
 
   private async handleSearch(query: string, scope?: unknown): Promise<void> {
@@ -1460,6 +1499,58 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     }
     .attached-session-row button:hover { color: var(--fg); border-color: var(--fg); }
     .attached-session-row button.danger:hover { color: var(--error); border-color: var(--error); }
+
+    /* Webex */
+    .webex-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: color-mix(in srgb, var(--vscode-terminal-ansiGreen, #4ec9b0) 16%, transparent);
+      color: var(--vscode-terminal-ansiGreen, #4ec9b0);
+      border: 1px solid color-mix(in srgb, var(--vscode-terminal-ansiGreen, #4ec9b0) 40%, transparent);
+      border-radius: 10px;
+      font-size: 10px;
+      padding: 1px 6px;
+      cursor: pointer;
+      flex-shrink: 0;
+      line-height: 1.4;
+      font-family: inherit;
+    }
+    .webex-chip:hover {
+      background: color-mix(in srgb, var(--vscode-terminal-ansiGreen, #4ec9b0) 28%, transparent);
+    }
+    .webex-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      background: var(--hover-bg);
+      font-size: 11.5px;
+    }
+    .webex-icon { flex-shrink: 0; }
+    .webex-link {
+      flex: 1;
+      color: var(--link);
+      text-decoration: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: pointer;
+    }
+    .webex-link:hover { text-decoration: underline; }
+    .webex-action {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--dim);
+      cursor: pointer;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: inherit;
+      flex-shrink: 0;
+    }
+    .webex-action:hover { color: var(--error); border-color: var(--error); }
 
     /* Linked-TODO indicator on session cards */
     .session-todo-badge {
@@ -2739,10 +2830,12 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const statusLabel = TODO_STATUS_LABELS[status] || status;
       const sessCount = (todo.attachedSessions || todo.sessionIds || []).length;
       const notes = todo.notes || '';
+      const hasWebex = !!(todo.webexLink && todo.webexLink.trim().length > 0);
 
       el.innerHTML =
         '<div class="todo-card-header">' +
           '<span class="todo-card-title">' + escapeHtml(todo.title) + '</span>' +
+          (hasWebex ? '<button class="webex-chip" data-action="openWebex" title="Open Webex link">&#x1F4F9;</button>' : '') +
           '<span class="todo-status-pill status-' + status + '"><span class="status-dot"></span>' + escapeHtml(statusLabel) + '</span>' +
         '</div>' +
         (notes ? '<div class="todo-card-notes">' + escapeHtml(notes) + '</div>' : '') +
@@ -2751,6 +2844,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           '<span class="meta-dot">&#183;</span>' +
           '<span>' + escapeHtml(formatRelativeTime(todo.updatedAt)) + '</span>' +
         '</div>';
+
+      const webexBtn = el.querySelector('.webex-chip');
+      if (webexBtn) {
+        webexBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (todo.webexLink) {
+            vscode.postMessage({ type: 'todoOpenWebexLink', url: todo.webexLink });
+          }
+        });
+      }
 
       el.addEventListener('click', () => openTodoDetail(todo.id));
       el.addEventListener('keydown', (e) => {
@@ -2781,7 +2884,8 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       todoDetailActions.innerHTML =
         '<button class="act-btn primary" id="tEditTitle">Rename</button>' +
         '<button class="act-btn" id="tSetStatus">Status</button>' +
-        '<button class="act-btn" id="tAttach">+ Attach Session</button>' +
+        '<button class="act-btn" id="tAttach">+ Session</button>' +
+        '<button class="act-btn" id="tWebex">' + (todo.webexLink ? 'Edit Webex' : '+ Webex') + '</button>' +
         '<button class="act-btn danger" id="tDelete">Delete</button>';
 
       const attached = todo.attachedSessions || (todo.sessionIds || []).map(id => ({ id, title: '(unknown session)' }));
@@ -2801,10 +2905,22 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
       const safeNotes = escapeHtml(todo.notes || '');
 
+      const webexHtml = todo.webexLink
+        ? '<div class="webex-row">' +
+            '<span class="webex-icon">&#x1F4F9;</span>' +
+            '<a href="#" class="webex-link" id="tWebexOpen" title="' + escapeHtml(todo.webexLink) + '">' + escapeHtml(todo.webexLink) + '</a>' +
+            '<button class="webex-action" id="tWebexClear" title="Remove Webex link">&#x2715;</button>' +
+          '</div>'
+        : '<button class="act-btn" id="tWebexAdd" style="font-size:10px;padding:2px 8px;">+ Add Webex Link</button>';
+
       todoDetailBody.innerHTML =
         '<div class="detail-section">' +
           '<h4>Status</h4>' +
           '<span class="todo-status-pill status-' + status + '"><span class="status-dot"></span>' + escapeHtml(statusLabel) + '</span>' +
+        '</div>' +
+        '<div class="detail-section">' +
+          '<h4>Webex</h4>' +
+          webexHtml +
         '</div>' +
         '<div class="detail-section">' +
           '<h4>Notes</h4>' +
@@ -2838,8 +2954,28 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       tAttach.addEventListener('click', () => {
         vscode.postMessage({ type: 'todoAttachSession', todoId: todo.id });
       });
+      const tWebex = document.getElementById('tWebex');
+      tWebex?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoSetWebexLink', todoId: todo.id });
+      });
       tDelete.addEventListener('click', () => {
         vscode.postMessage({ type: 'todoDelete', todoId: todo.id });
+      });
+
+      const tWebexOpen = document.getElementById('tWebexOpen');
+      tWebexOpen?.addEventListener('click', (e) => {
+        e.preventDefault();
+        if (todo.webexLink) {
+          vscode.postMessage({ type: 'todoOpenWebexLink', url: todo.webexLink });
+        }
+      });
+      const tWebexClear = document.getElementById('tWebexClear');
+      tWebexClear?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoClearWebexLink', todoId: todo.id });
+      });
+      const tWebexAdd = document.getElementById('tWebexAdd');
+      tWebexAdd?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoSetWebexLink', todoId: todo.id });
       });
 
       // Save notes on blur if changed

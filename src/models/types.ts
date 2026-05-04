@@ -134,6 +134,7 @@ export interface Todo {
   notes?: string;
   status: TodoStatus;
   sessionIds: string[];
+  webexLink?: string;
   createdAt: number;
   updatedAt: number;
 }

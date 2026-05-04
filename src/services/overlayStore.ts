@@ -405,7 +405,7 @@ export class OverlayStore {
 
   async updateTodo(
     id: string,
-    patch: Partial<Pick<Todo, 'title' | 'notes' | 'status'>>,
+    patch: Partial<Pick<Todo, 'title' | 'notes' | 'status' | 'webexLink'>>,
   ): Promise<void> {
     const todo = this.ensureTodos()[id];
     if (!todo) { return; }
@@ -417,6 +417,10 @@ export class OverlayStore {
     }
     if (patch.status !== undefined) {
       todo.status = patch.status;
+    }
+    if (patch.webexLink !== undefined) {
+      const trimmed = patch.webexLink.trim();
+      todo.webexLink = trimmed || undefined;
     }
     todo.updatedAt = Date.now();
     this.dirty = true;
