@@ -127,6 +127,12 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'todoCreate':
           await this.handleTodoCreate(msg.title, msg.notes, msg.sessionIds);
           break;
+        case 'todoCreatePrompt':
+          await this.handleTodoCreatePrompt();
+          break;
+        case 'todoRenamePrompt':
+          await this.handleTodoRenamePrompt(msg.todoId);
+          break;
         case 'todoUpdate':
           await this.handleTodoUpdate(msg.todoId, {
             title: msg.title,
@@ -284,6 +290,30 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       ? rawSessionIds.filter((s): s is string => typeof s === 'string')
       : [];
     await this.overlay.createTodo(title, notes, sessionIds);
+  }
+
+  private async handleTodoCreatePrompt(): Promise<void> {
+    const title = await vscode.window.showInputBox({
+      prompt: 'New TODO title',
+      placeHolder: 'e.g., Investigate flaky auth flow',
+    });
+    if (!title?.trim()) { return; }
+    await this.overlay.createTodo(title.trim());
+  }
+
+  private async handleTodoRenamePrompt(todoId: unknown): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    const todo = this.overlay.getTodo(todoId);
+    if (!todo) { return; }
+    const next = await vscode.window.showInputBox({
+      prompt: 'Rename TODO',
+      value: todo.title,
+      placeHolder: 'TODO title',
+    });
+    if (next === undefined) { return; }
+    const trimmed = next.trim();
+    if (!trimmed || trimmed === todo.title) { return; }
+    await this.overlay.updateTodo(todoId, { title: trimmed });
   }
 
   private async handleTodoUpdate(
@@ -2943,10 +2973,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const tNotes = document.getElementById('tNotes');
 
       tEditTitle.addEventListener('click', () => {
-        const next = window.prompt('Rename TODO', todo.title);
-        if (next !== null && next.trim().length > 0 && next !== todo.title) {
-          vscode.postMessage({ type: 'todoUpdate', todoId: todo.id, title: next.trim() });
-        }
+        vscode.postMessage({ type: 'todoRenamePrompt', todoId: todo.id });
       });
       tSetStatus.addEventListener('click', () => {
         vscode.postMessage({ type: 'todoSetStatus', todoId: todo.id });
@@ -3015,10 +3042,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     });
 
     newTodoBtn.addEventListener('click', () => {
-      const title = window.prompt('New TODO title');
-      if (title && title.trim().length > 0) {
-        vscode.postMessage({ type: 'todoCreate', title: title.trim() });
-      }
+      vscode.postMessage({ type: 'todoCreatePrompt' });
     });
 
     let todoSearchTimeout = null;
