@@ -858,23 +858,26 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       display: inline-flex;
       align-items: center;
       gap: 4px;
-      font-size: 9px;
+      font-size: 10px;
       font-weight: 600;
-      padding: 2px 7px;
-      border-radius: 3px;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
+      padding: 1px 7px;
+      border-radius: 10px;
       flex-shrink: 0;
       cursor: pointer;
-      border: none;
-      transition: opacity 0.12s;
+      border: 1px solid currentColor;
+      background: color-mix(in srgb, currentColor 12%, transparent);
+      transition: opacity 0.12s, background 0.12s;
+      white-space: nowrap;
+      line-height: 1.4;
+      font-family: inherit;
     }
-    .status-badge:hover { opacity: 0.8; }
+    .status-badge:hover { background: color-mix(in srgb, currentColor 20%, transparent); }
     .status-dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
       flex-shrink: 0;
+      background: currentColor;
     }
 
     .card-branches {
@@ -1324,6 +1327,11 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       in_review:'In Code Review', changes_requested:'Changes Requested',
       approved:'Approved', merged:'Merged', done:'Done', abandoned:'Abandoned'
     };
+    const STATUS_SHORT_LABELS = {
+      none:'', todo:'TODO', in_progress:'WIP', pr_created:'PR',
+      in_review:'Review', changes_requested:'Changes',
+      approved:'Approved', merged:'Merged', done:'Done', abandoned:'Closed'
+    };
     const STATUS_COLORS = {
       none:'', 
       todo:'var(--vscode-descriptionForeground)', 
@@ -1694,6 +1702,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
       const status = session.status || 'none';
       const statusLabel = STATUS_LABELS[status] || '';
+      const statusShort = STATUS_SHORT_LABELS[status] || statusLabel;
       const statusColor = STATUS_COLORS[status] || '';
 
       const createdText = session.createdAt ? formatAbsoluteDate(session.createdAt) : '';
@@ -1703,7 +1712,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         '<span class="session-checkbox" aria-hidden="true">' + (isSelected ? '&#x2713;' : '') + '</span>' +
         '<div class="card-header">' +
           '<span class="card-title">' + escapeHtml(session.displayName) + '</span>' +
-          (statusLabel ? '<button class="status-badge" data-action="setStatus" data-id="' + safeId + '" title="' + escapeHtml(statusLabel) + '" style="padding:2px;background:none;"><span class="status-dot" style="background:' + statusColor + ';"></span></button>' : '') +
+          (statusLabel
+            ? '<button class="status-badge" data-action="setStatus" data-id="' + safeId
+              + '" title="' + escapeHtml(statusLabel)
+              + '" style="color:' + statusColor + ';">'
+              + '<span class="status-dot"></span>'
+              + escapeHtml(statusShort)
+              + '</button>'
+            : '') +
           '<span class="pin-toggle" data-action="pin" data-id="' + safeId + '">' + pinSymbol + '</span>' +
         '</div>' +
         (subtitle ? '<div class="card-subtitle">' + escapeHtml(subtitle) + '</div>' : '') +
