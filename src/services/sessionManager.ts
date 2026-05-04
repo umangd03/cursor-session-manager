@@ -57,6 +57,10 @@ export class SessionManager {
     return this.cachedSessions.find(s => s.id === sessionId);
   }
 
+  async getActiveSessionId(currentFolderPaths: string[]): Promise<string | undefined> {
+    return this.dbReader.getActiveSessionId(currentFolderPaths);
+  }
+
   /**
    * Full-text search over sessions.
    *

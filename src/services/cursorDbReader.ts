@@ -108,6 +108,61 @@ export class CursorDbReader {
     return results.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
   }
 
+  /**
+   * Returns the composerId of the session that Cursor most recently focused
+   * for one of the provided workspace folder paths. We read each workspace's
+   * `state.vscdb` and pick `lastFocusedComposerIds[0]` from the workspace whose
+   * DB file was modified most recently. This lets us track Cursor's native
+   * session selection in real time across multiple windows.
+   */
+  async getActiveSessionId(currentFolderPaths: string[]): Promise<string | undefined> {
+    try {
+      const workspaces = this.getAvailableWorkspaces();
+      if (workspaces.length === 0) { return undefined; }
+
+      const normalized = new Set(currentFolderPaths.map(p => path.resolve(p)));
+      const matching = normalized.size > 0
+        ? workspaces.filter(w => w.folderPath && normalized.has(path.resolve(w.folderPath)))
+        : [];
+
+      const candidates = matching.length > 0 ? matching : workspaces.slice(0, 1);
+      candidates.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
+
+      for (const ws of candidates) {
+        const id = await this.readActiveFromWorkspaceDb(ws.dbPath);
+        if (id) { return id; }
+      }
+      return undefined;
+    } catch (err) {
+      log.error('getActiveSessionId failed', err);
+      return undefined;
+    }
+  }
+
+  private async readActiveFromWorkspaceDb(dbPath: string): Promise<string | undefined> {
+    let db: Database | null = null;
+    try {
+      const SQL = await getSql();
+      const buffer = fs.readFileSync(dbPath);
+      db = new SQL.Database(buffer);
+      const results = db.exec("SELECT value FROM ItemTable WHERE key = 'composer.composerData'");
+      if (!results.length || !results[0].values.length) { return undefined; }
+      const rawValue = results[0].values[0][0];
+      if (typeof rawValue !== 'string') { return undefined; }
+      const data = JSON.parse(rawValue);
+      const ids = data?.lastFocusedComposerIds;
+      if (Array.isArray(ids) && ids.length > 0 && typeof ids[0] === 'string') {
+        return ids[0];
+      }
+      return undefined;
+    } catch (err) {
+      log.error('readActiveFromWorkspaceDb failed', err);
+      return undefined;
+    } finally {
+      try { db?.close(); } catch { /* ignore */ }
+    }
+  }
+
   async readAllSessions(): Promise<CursorRawSession[]> {
     try {
       this.transcriptIndex = null;

@@ -11,6 +11,9 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private currentWorkspaceOnly = false;
+  private activePollTimer?: NodeJS.Timeout;
+  private currentActiveSessionId?: string;
+  private readonly ACTIVE_POLL_INTERVAL_MS = 2000;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -130,12 +133,47 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         void this.sendRefresh();
       }
     });
+
+    this.startActiveSessionPolling();
+    webviewView.onDidDispose(() => this.stopActiveSessionPolling());
   }
 
   private configDisposable?: vscode.Disposable;
 
   dispose(): void {
     this.configDisposable?.dispose();
+    this.stopActiveSessionPolling();
+  }
+
+  private startActiveSessionPolling(): void {
+    this.stopActiveSessionPolling();
+    void this.pollActiveSession();
+    this.activePollTimer = setInterval(
+      () => { void this.pollActiveSession(); },
+      this.ACTIVE_POLL_INTERVAL_MS,
+    );
+  }
+
+  private stopActiveSessionPolling(): void {
+    if (this.activePollTimer) {
+      clearInterval(this.activePollTimer);
+      this.activePollTimer = undefined;
+    }
+  }
+
+  private async pollActiveSession(): Promise<void> {
+    if (!this.view) { return; }
+    try {
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      const folderPaths = folders.map(f => f.uri.fsPath);
+      const activeId = await this.sessionManager.getActiveSessionId(folderPaths);
+      if (activeId !== this.currentActiveSessionId) {
+        this.currentActiveSessionId = activeId;
+        this.view.webview.postMessage({ type: 'activeSession', sessionId: activeId ?? null });
+      }
+    } catch (err) {
+      log.error('pollActiveSession failed', err);
+    }
   }
 
   private async sendRefresh(): Promise<void> {
@@ -160,6 +198,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         hasWorkspace: !!wsPath,
         hiddenCount,
         jiraBaseUrl: getJiraBaseUrl(),
+        activeSessionId: this.currentActiveSessionId ?? null,
       });
       log.info('sendRefresh: done');
     } catch (err) {
@@ -699,6 +738,31 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     .session-card:focus-visible { outline: 1px solid var(--focus); outline-offset: -1px; }
     .session-card:active { transform: scale(0.995); }
     .session-card.pinned { border-left-color: var(--link); }
+
+    /* Currently focused session in Cursor (live tracked from native UI) */
+    .session-card.active {
+      background: color-mix(in srgb, var(--link) 16%, transparent);
+      border-left-color: var(--success);
+    }
+    .session-card.active:hover,
+    .session-card.active:focus-visible {
+      background: color-mix(in srgb, var(--link) 22%, transparent);
+    }
+    .session-card.active::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      right: 8px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      transform: translateY(-50%);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 30%, transparent);
+      pointer-events: none;
+    }
+    body.select-mode .session-card.active::after,
+    .session-card.active:hover::after { display: none; }
 
     .card-header {
       display: flex;
@@ -1252,6 +1316,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     let currentSort = 'lastMessageAt';
     let jiraBaseUrl = '';
     let selectMode = false;
+    let activeSessionId = null;
     const selectedIds = new Set();
 
     const STATUS_LABELS = {
@@ -1444,12 +1509,20 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           '</div>';
       }
 
+      if (msg.type === 'activeSession') {
+        activeSessionId = msg.sessionId || null;
+        applyActiveHighlight();
+      }
+
       if (msg.type === 'sessions') {
         loadingState.style.display = 'none';
         refreshBtn.classList.remove('spinning');
         allSessions = msg.sessions || [];
         if (typeof msg.jiraBaseUrl === 'string') {
           jiraBaseUrl = msg.jiraBaseUrl;
+        }
+        if (msg.activeSessionId !== undefined) {
+          activeSessionId = msg.activeSessionId || null;
         }
         // Drop stale selection ids that were just deleted / hidden.
         const visibleIds = new Set(allSessions.map(s => s.id));
@@ -1533,6 +1606,15 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       return [...pinned, ...rest];
     }
 
+    function applyActiveHighlight() {
+      const cards = sessionList.querySelectorAll('.session-card');
+      cards.forEach(card => {
+        const id = card.getAttribute('data-session-id');
+        const isActive = !!activeSessionId && id === activeSessionId;
+        card.classList.toggle('active', isActive);
+      });
+    }
+
     function renderSessions(sessions) {
       const sorted = sortSessions(sessions);
       sessionList.innerHTML = '';
@@ -1577,10 +1659,12 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     function createSessionCard(session) {
       const el = document.createElement('div');
       const isSelected = selectedIds.has(session.id);
+      const isActive = activeSessionId && session.id === activeSessionId;
       el.className = 'session-card' +
         (session.pinned ? ' pinned' : '') +
         (selectMode ? ' selectable' : '') +
-        (isSelected ? ' selected' : '');
+        (isSelected ? ' selected' : '') +
+        (isActive ? ' active' : '');
       el.setAttribute('tabindex', '0');
       el.setAttribute('role', 'listitem');
       el.setAttribute('aria-label', session.displayName || 'Session');
