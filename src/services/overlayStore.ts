@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
-import { OverlayMetadata, OverlayStore as OverlayStoreData, SessionGroup, SessionStatus } from '../models/types';
+import { OverlayMetadata, OverlayStore as OverlayStoreData, SessionGroup, SessionStatus, Todo, TodoStatus } from '../models/types';
 
 const STORE_FILENAME = 'sessions-overlay.json';
 const CURRENT_VERSION = 1;
@@ -362,6 +362,104 @@ export class OverlayStore {
       }
     }
     return [...tagSet].sort();
+  }
+
+  // --- Todos ---
+
+  private ensureTodos(): Record<string, Todo> {
+    if (!this.data.todos) { this.data.todos = {}; }
+    return this.data.todos;
+  }
+
+  getAllTodos(): Todo[] {
+    return Object.values(this.ensureTodos());
+  }
+
+  getTodo(id: string): Todo | undefined {
+    return this.ensureTodos()[id];
+  }
+
+  getTodosForSession(sessionId: string): Todo[] {
+    return this.getAllTodos().filter(t => t.sessionIds.includes(sessionId));
+  }
+
+  async createTodo(title: string, notes?: string, sessionIds: string[] = []): Promise<Todo> {
+    const todos = this.ensureTodos();
+    const id = `todo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now();
+    const todo: Todo = {
+      id,
+      title: title.trim() || 'Untitled TODO',
+      notes: notes?.trim() || undefined,
+      status: 'open',
+      sessionIds: [...new Set(sessionIds.filter(Boolean))],
+      createdAt: now,
+      updatedAt: now,
+    };
+    todos[id] = todo;
+    this.dirty = true;
+    await this.save();
+    this._onDidChange.fire(undefined);
+    return todo;
+  }
+
+  async updateTodo(
+    id: string,
+    patch: Partial<Pick<Todo, 'title' | 'notes' | 'status'>>,
+  ): Promise<void> {
+    const todo = this.ensureTodos()[id];
+    if (!todo) { return; }
+    if (patch.title !== undefined) {
+      todo.title = patch.title.trim() || todo.title;
+    }
+    if (patch.notes !== undefined) {
+      todo.notes = patch.notes.trim() || undefined;
+    }
+    if (patch.status !== undefined) {
+      todo.status = patch.status;
+    }
+    todo.updatedAt = Date.now();
+    this.dirty = true;
+    await this.save();
+    this._onDidChange.fire(undefined);
+  }
+
+  async setTodoStatus(id: string, status: TodoStatus): Promise<void> {
+    await this.updateTodo(id, { status });
+  }
+
+  async deleteTodo(id: string): Promise<void> {
+    const todos = this.ensureTodos();
+    if (!todos[id]) { return; }
+    delete todos[id];
+    this.dirty = true;
+    await this.save();
+    this._onDidChange.fire(undefined);
+  }
+
+  async attachSessionToTodo(todoId: string, sessionId: string): Promise<void> {
+    const todo = this.ensureTodos()[todoId];
+    if (!todo || !sessionId) { return; }
+    if (!todo.sessionIds.includes(sessionId)) {
+      todo.sessionIds.push(sessionId);
+      todo.updatedAt = Date.now();
+      this.dirty = true;
+      await this.save();
+      this._onDidChange.fire(sessionId);
+    }
+  }
+
+  async detachSessionFromTodo(todoId: string, sessionId: string): Promise<void> {
+    const todo = this.ensureTodos()[todoId];
+    if (!todo) { return; }
+    const idx = todo.sessionIds.indexOf(sessionId);
+    if (idx !== -1) {
+      todo.sessionIds.splice(idx, 1);
+      todo.updatedAt = Date.now();
+      this.dirty = true;
+      await this.save();
+      this._onDidChange.fire(sessionId);
+    }
   }
 
   dispose(): void {

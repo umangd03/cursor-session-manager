@@ -124,6 +124,39 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'openJiraSettings':
           await configureJiraBaseUrl();
           break;
+        case 'todoCreate':
+          await this.handleTodoCreate(msg.title, msg.notes, msg.sessionIds);
+          break;
+        case 'todoUpdate':
+          await this.handleTodoUpdate(msg.todoId, {
+            title: msg.title,
+            notes: msg.notes,
+            status: msg.status,
+          });
+          break;
+        case 'todoDelete':
+          await this.handleTodoDelete(msg.todoId);
+          break;
+        case 'todoSetStatus':
+          await this.handleTodoSetStatus(msg.todoId);
+          break;
+        case 'todoAttachSession':
+          await this.handleTodoAttachSession(msg.todoId);
+          break;
+        case 'todoDetachSession':
+          if (typeof msg.todoId === 'string' && typeof msg.sessionId === 'string') {
+            await this.overlay.detachSessionFromTodo(msg.todoId, msg.sessionId);
+          }
+          break;
+        case 'todoQuickCreateForSession':
+          await this.handleTodoQuickCreateForSession(msg.sessionId);
+          break;
+        case 'attachSessionToTodo':
+          await this.handleAttachSessionToTodo(msg.sessionId);
+          break;
+        case 'requestTodos':
+          await this.sendTodos();
+          break;
       }
     });
 
@@ -192,6 +225,13 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const wsPath = this.getCurrentWorkspacePath();
       log.info(`sendRefresh: posting to webview (${tags.length} tags, ${groups.length} groups)`);
       const hiddenCount = this.overlay.getHiddenCount();
+      const todoCountBySession: Record<string, number> = {};
+      for (const t of this.overlay.getAllTodos()) {
+        if (t.status === 'archived') { continue; }
+        for (const sid of t.sessionIds) {
+          todoCountBySession[sid] = (todoCountBySession[sid] ?? 0) + 1;
+        }
+      }
       this.view.webview.postMessage({
         type: 'sessions', sessions, tags, groups,
         workspaceOnly: this.currentWorkspaceOnly,
@@ -199,12 +239,145 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         hiddenCount,
         jiraBaseUrl: getJiraBaseUrl(),
         activeSessionId: this.currentActiveSessionId ?? null,
+        todoCountBySession,
       });
+      await this.sendTodos();
       log.info('sendRefresh: done');
     } catch (err) {
       log.error('sendRefresh failed', err);
       this.view.webview.postMessage({ type: 'error', message: String(err) });
     }
+  }
+
+  private async sendTodos(): Promise<void> {
+    if (!this.view) { return; }
+    try {
+      const todos = await this.sessionManager.getTodosWithSessionTitles();
+      this.view.webview.postMessage({ type: 'todos', todos });
+    } catch (err) {
+      log.error('sendTodos failed', err);
+    }
+  }
+
+  private async handleTodoCreate(
+    rawTitle: unknown,
+    rawNotes: unknown,
+    rawSessionIds: unknown,
+  ): Promise<void> {
+    const title = typeof rawTitle === 'string' ? rawTitle.trim() : '';
+    if (!title) { return; }
+    const notes = typeof rawNotes === 'string' ? rawNotes : undefined;
+    const sessionIds = Array.isArray(rawSessionIds)
+      ? rawSessionIds.filter((s): s is string => typeof s === 'string')
+      : [];
+    await this.overlay.createTodo(title, notes, sessionIds);
+  }
+
+  private async handleTodoUpdate(
+    todoId: unknown,
+    patch: { title?: unknown; notes?: unknown; status?: unknown },
+  ): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    const update: { title?: string; notes?: string; status?: import('../models/types').TodoStatus } = {};
+    if (typeof patch.title === 'string') { update.title = patch.title; }
+    if (typeof patch.notes === 'string') { update.notes = patch.notes; }
+    if (typeof patch.status === 'string') {
+      const allowed = ['open', 'in_progress', 'done', 'archived'] as const;
+      if ((allowed as readonly string[]).includes(patch.status)) {
+        update.status = patch.status as import('../models/types').TodoStatus;
+      }
+    }
+    await this.overlay.updateTodo(todoId, update);
+  }
+
+  private async handleTodoDelete(todoId: unknown): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    const todo = this.overlay.getTodo(todoId);
+    if (!todo) { return; }
+    const choice = await vscode.window.showWarningMessage(
+      `Delete TODO "${todo.title}"?`,
+      { modal: true },
+      'Delete',
+    );
+    if (choice !== 'Delete') { return; }
+    await this.overlay.deleteTodo(todoId);
+  }
+
+  private async handleTodoSetStatus(todoId: unknown): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    const { TODO_STATUS_LABELS } = await import('../models/types');
+    const entries = Object.entries(TODO_STATUS_LABELS) as [
+      import('../models/types').TodoStatus,
+      string,
+    ][];
+    const picks = entries.map(([key, label]) => ({ label, statusKey: key }));
+    const selected = await vscode.window.showQuickPick(picks, {
+      placeHolder: 'Set TODO status',
+    });
+    if (selected) {
+      await this.overlay.setTodoStatus(todoId, selected.statusKey);
+    }
+  }
+
+  private async handleTodoAttachSession(todoId: unknown): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    const todo = this.overlay.getTodo(todoId);
+    if (!todo) { return; }
+    const sessions = await this.sessionManager.getSessions();
+    const attached = new Set(todo.sessionIds);
+    const items = sessions
+      .filter(s => !attached.has(s.id))
+      .map(s => ({ label: s.displayName, description: s.jiraTicket ?? '', sessionId: s.id }));
+    if (items.length === 0) {
+      void vscode.window.showInformationMessage('All sessions are already attached to this TODO.');
+      return;
+    }
+    const selected = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Attach session to TODO',
+      matchOnDescription: true,
+    });
+    if (selected) {
+      await this.overlay.attachSessionToTodo(todoId, selected.sessionId);
+    }
+  }
+
+  private async handleAttachSessionToTodo(sessionId: unknown): Promise<void> {
+    if (typeof sessionId !== 'string' || !sessionId) { return; }
+    const session = await this.sessionManager.getSession(sessionId);
+    if (!session) { return; }
+
+    const allTodos = this.overlay.getAllTodos().filter(t => t.status !== 'archived');
+    const NEW_TODO = '__new__';
+    const items: vscode.QuickPickItem[] = [
+      { label: '$(add) New TODO…', description: 'Create a new TODO and attach this session', detail: NEW_TODO },
+      ...allTodos.map(t => ({
+        label: t.title,
+        description: `${t.status} · ${t.sessionIds.length} sessions`,
+        detail: t.id,
+      })),
+    ];
+
+    const picked = await vscode.window.showQuickPick(items, {
+      placeHolder: `Attach "${session.displayName}" to TODO`,
+    });
+    if (!picked) { return; }
+    if (picked.detail === NEW_TODO) {
+      await this.handleTodoQuickCreateForSession(sessionId);
+      return;
+    }
+    if (picked.detail) {
+      await this.overlay.attachSessionToTodo(picked.detail, sessionId);
+    }
+  }
+
+  private async handleTodoQuickCreateForSession(sessionId: unknown): Promise<void> {
+    const sid = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined;
+    const title = await vscode.window.showInputBox({
+      prompt: 'TODO title',
+      placeHolder: 'e.g., Investigate flaky auth flow',
+    });
+    if (!title?.trim()) { return; }
+    await this.overlay.createTodo(title.trim(), undefined, sid ? [sid] : []);
   }
 
   private async handleSearch(query: string, scope?: unknown): Promise<void> {
@@ -218,7 +391,19 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       tags,
       groups: [],
       jiraBaseUrl: getJiraBaseUrl(),
+      todoCountBySession: this.buildTodoCountBySession(),
     });
+  }
+
+  private buildTodoCountBySession(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const t of this.overlay.getAllTodos()) {
+      if (t.status === 'archived') { continue; }
+      for (const sid of t.sessionIds) {
+        counts[sid] = (counts[sid] ?? 0) + 1;
+      }
+    }
+    return counts;
   }
 
   private async handleRename(sessionId: string): Promise<void> {
@@ -424,6 +609,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         groups: [],
         activeFilter: tag,
         jiraBaseUrl: getJiraBaseUrl(),
+        todoCountBySession: this.buildTodoCountBySession(),
       });
     }
   }
@@ -490,6 +676,52 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       from { opacity: 0; max-height: 0; }
       to { opacity: 1; max-height: 600px; }
     }
+
+    /* --- Tabs / Panels --- */
+    .tab-bar {
+      position: sticky;
+      top: 0;
+      z-index: 11;
+      display: flex;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }
+    .tab-btn {
+      flex: 1;
+      background: none;
+      border: none;
+      color: var(--dim);
+      padding: 8px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: color 0.12s, border-color 0.12s;
+    }
+    .tab-btn:hover { color: var(--fg); }
+    .tab-btn.active {
+      color: var(--fg);
+      border-bottom-color: var(--link);
+    }
+    .tab-count {
+      font-size: 10px;
+      font-weight: 600;
+      background: color-mix(in srgb, var(--fg) 12%, transparent);
+      color: var(--fg);
+      padding: 1px 6px;
+      border-radius: 8px;
+      min-width: 14px;
+      line-height: 1.4;
+    }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .panel .toolbar { top: 32px; } /* sit below the tab bar when sticky */
+    .panel .detail-header { top: 32px; } /* same for detail header */
 
     /* --- Toolbar --- */
     .toolbar {
@@ -1101,6 +1333,148 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       opacity: 0.85;
     }
 
+    /* --- TODOs --- */
+    .todo-list { padding: 4px 0; }
+    .todo-card {
+      margin: 2px 6px;
+      padding: 9px 10px;
+      border-radius: var(--card-radius);
+      cursor: pointer;
+      border-left: 3px solid var(--border);
+      transition: background 0.12s, border-color 0.12s;
+      animation: fadeIn 0.2s ease-out both;
+      position: relative;
+    }
+    .todo-card:hover,
+    .todo-card:focus-visible { background: var(--hover-bg); }
+    .todo-card:focus-visible { outline: 1px solid var(--focus); outline-offset: -1px; }
+    .todo-card.status-open { border-left-color: var(--vscode-descriptionForeground); }
+    .todo-card.status-in_progress { border-left-color: var(--vscode-terminal-ansiBlue); }
+    .todo-card.status-done { border-left-color: var(--vscode-testing-iconPassed); }
+    .todo-card.status-archived { border-left-color: var(--vscode-disabledForeground); opacity: 0.6; }
+    .todo-card.status-done .todo-card-title { text-decoration: line-through; opacity: 0.7; }
+
+    .todo-card-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .todo-card-title {
+      flex: 1;
+      font-size: 12.5px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.3;
+    }
+    .todo-card-notes {
+      font-size: 11px;
+      color: var(--dim);
+      margin-top: 4px;
+      line-height: 1.4;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .todo-card-meta {
+      font-size: 10.5px;
+      color: var(--dim);
+      margin-top: 5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .todo-status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 7px;
+      border-radius: 10px;
+      border: 1px solid currentColor;
+      background: color-mix(in srgb, currentColor 12%, transparent);
+      flex-shrink: 0;
+      white-space: nowrap;
+      line-height: 1.4;
+    }
+    .todo-status-pill.status-open { color: var(--vscode-descriptionForeground); }
+    .todo-status-pill.status-in_progress { color: var(--vscode-terminal-ansiBlue); }
+    .todo-status-pill.status-done { color: var(--vscode-testing-iconPassed); }
+    .todo-status-pill.status-archived { color: var(--vscode-disabledForeground); }
+
+    .session-link-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 10px;
+      color: var(--dim);
+      flex-shrink: 0;
+    }
+
+    .todo-notes-editor {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 100px;
+      max-height: 320px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--fg);
+      font-family: inherit;
+      font-size: 12px;
+      line-height: 1.5;
+      resize: vertical;
+    }
+    .todo-notes-editor:focus { outline: 1px solid var(--focus); border-color: var(--focus); }
+
+    .attached-session-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      background: var(--hover-bg);
+      margin-bottom: 4px;
+      font-size: 12px;
+    }
+    .attached-session-row .attached-title {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .attached-session-row button {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--dim);
+      cursor: pointer;
+      padding: 2px 7px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: inherit;
+    }
+    .attached-session-row button:hover { color: var(--fg); border-color: var(--fg); }
+    .attached-session-row button.danger:hover { color: var(--error); border-color: var(--error); }
+
+    /* Linked-TODO indicator on session cards */
+    .session-todo-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--link) 14%, transparent);
+      color: var(--link);
+      flex-shrink: 0;
+      line-height: 1.4;
+    }
+
     /* --- Detail panel --- */
     .detail-panel { display: none; padding: 0; overflow-y: auto; }
     .detail-panel.active { display: block; animation: fadeIn 0.2s ease-out; }
@@ -1243,6 +1617,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
+  <div class="tab-bar" role="tablist">
+    <button class="tab-btn active" id="tabSessions" role="tab" aria-selected="true" data-tab="sessions">Sessions</button>
+    <button class="tab-btn" id="tabTodos" role="tab" aria-selected="false" data-tab="todos">
+      TODOs <span class="tab-count" id="todoTabCount">0</span>
+    </button>
+  </div>
+
+  <div id="sessionsPanel" class="panel active">
   <div class="toolbar">
     <div class="toolbar-row">
       <div class="search-wrap">
@@ -1310,6 +1692,49 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     <div class="detail-actions" id="detailActions"></div>
     <div class="detail-body" id="detailBody"></div>
   </div>
+  </div>
+
+  <div id="todosPanel" class="panel">
+    <div class="toolbar">
+      <div class="toolbar-row">
+        <div class="search-wrap">
+          <span class="search-icon">&#x1F50D;</span>
+          <input class="search-input" id="todoSearchInput" type="text" placeholder="Search TODOs..." aria-label="Search TODOs" />
+        </div>
+      </div>
+      <div class="toolbar-row" style="justify-content: space-between;">
+        <div style="display: flex; gap: 4px;">
+          <select class="sort-select" id="todoStatusFilter" title="Filter by status">
+            <option value="active">Active</option>
+            <option value="all">All</option>
+            <option value="open">Open</option>
+            <option value="in_progress">In Progress</option>
+            <option value="done">Done</option>
+            <option value="archived">Archived</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 4px;">
+          <button class="toggle-btn" id="newTodoBtn" title="Create a new TODO">+ New TODO</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="todoListView">
+      <div class="todo-list" id="todoList" role="list" aria-label="TODOs"></div>
+      <div id="todoCounterRow" class="counter-row" style="justify-content: center; padding: 12px 0; border-top: 1px solid var(--border); margin-top: 8px;"></div>
+    </div>
+
+    <div id="todoDetailView" class="detail-panel">
+      <div class="detail-header">
+        <button class="detail-back" id="todoBackBtn">&#x2190; Back</button>
+        <div class="detail-title-row">
+          <div class="detail-title" id="todoDetailTitle"></div>
+        </div>
+      </div>
+      <div class="detail-actions" id="todoDetailActions"></div>
+      <div class="detail-body" id="todoDetailBody"></div>
+    </div>
+  </div>
 
   <script nonce="${nonce}">
     try {
@@ -1321,6 +1746,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     let selectMode = false;
     let activeSessionId = null;
     const selectedIds = new Set();
+
+    // TODO state
+    let allTodos = [];
+    let todoCountBySession = {};
+    let todoStatusFilter = 'active';
+    let todoSearchQuery = '';
+    let openTodoId = null;
+    let activeTab = 'sessions';
 
     const STATUS_LABELS = {
       none:'', todo:'TODO', in_progress:'In Progress', pr_created:'PR Created',
@@ -1371,6 +1804,24 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     const cancelSelectBtn = $('cancelSelectBtn');
     const scopeTitleBtn = $('scopeTitleBtn');
     const scopeAllBtn = $('scopeAllBtn');
+
+    const tabSessions = $('tabSessions');
+    const tabTodos = $('tabTodos');
+    const sessionsPanel = $('sessionsPanel');
+    const todosPanel = $('todosPanel');
+    const todoTabCount = $('todoTabCount');
+    const todoListEl = $('todoList');
+    const todoListView = $('todoListView');
+    const todoDetailView = $('todoDetailView');
+    const todoDetailTitle = $('todoDetailTitle');
+    const todoDetailActions = $('todoDetailActions');
+    const todoDetailBody = $('todoDetailBody');
+    const todoBackBtn = $('todoBackBtn');
+    const todoSearchInput = $('todoSearchInput');
+    const todoStatusFilterEl = $('todoStatusFilter');
+    const newTodoBtn = $('newTodoBtn');
+    const todoCounterRow = $('todoCounterRow');
+
     let wsOnly = false;
 
     const persisted = (typeof vscode.getState === 'function' ? vscode.getState() : null) || {};
@@ -1532,6 +1983,9 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         if (msg.activeSessionId !== undefined) {
           activeSessionId = msg.activeSessionId || null;
         }
+        if (msg.todoCountBySession) {
+          todoCountBySession = msg.todoCountBySession;
+        }
         // Drop stale selection ids that were just deleted / hidden.
         const visibleIds = new Set(allSessions.map(s => s.id));
         for (const id of [...selectedIds]) {
@@ -1560,6 +2014,22 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
       if (msg.type === 'sessionDetail') {
         showDetail(msg.session, msg.related || []);
+      }
+
+      if (msg.type === 'todos') {
+        allTodos = Array.isArray(msg.todos) ? msg.todos : [];
+        updateTodoTabCount();
+        renderTodoList();
+        // If we're viewing a TODO that just got updated, re-render its detail.
+        if (openTodoId) {
+          const fresh = allTodos.find(t => t.id === openTodoId);
+          if (fresh) { showTodoDetail(fresh); }
+          else {
+            openTodoId = null;
+            todoDetailView.classList.remove('active');
+            todoListView.style.display = 'block';
+          }
+        }
       }
     });
 
@@ -1708,10 +2178,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const createdText = session.createdAt ? formatAbsoluteDate(session.createdAt) : '';
       const jiraBadgeHtml = buildJiraBadge(session.jiraTicket);
 
+      const todoCount = todoCountBySession[session.id] || 0;
+      const todoBadgeHtml = todoCount > 0
+        ? '<span class="session-todo-badge" title="Linked to ' + todoCount + ' TODO' + (todoCount !== 1 ? 's' : '') + '">&#x1F4CB; ' + todoCount + '</span>'
+        : '';
+
       el.innerHTML =
         '<span class="session-checkbox" aria-hidden="true">' + (isSelected ? '&#x2713;' : '') + '</span>' +
         '<div class="card-header">' +
           '<span class="card-title">' + escapeHtml(session.displayName) + '</span>' +
+          todoBadgeHtml +
           (statusLabel
             ? '<button class="status-badge" data-action="setStatus" data-id="' + safeId
               + '" title="' + escapeHtml(statusLabel)
@@ -1861,11 +2337,13 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       actionsEl.innerHTML =
         '<button class="act-btn primary" id="dOpen">Open in Chat</button>' +
         '<button class="act-btn" id="dPreview">Preview</button>' +
+        '<button class="act-btn" id="dAttachTodo">+ TODO</button>' +
         '<button class="act-btn" id="dExportMd">MD</button>' +
         '<button class="act-btn" id="dExportJson">JSON</button>';
 
       $('dOpen')?.addEventListener('click', () => vscode.postMessage({ type: 'openSession', sessionId: session.id }));
       $('dPreview')?.addEventListener('click', () => vscode.postMessage({ type: 'previewSession', sessionId: session.id }));
+      $('dAttachTodo')?.addEventListener('click', () => vscode.postMessage({ type: 'attachSessionToTodo', sessionId: session.id }));
       $('dExportMd')?.addEventListener('click', () => vscode.postMessage({ type: 'export', sessionId: session.id, format: 'markdown' }));
       $('dExportJson')?.addEventListener('click', () => vscode.postMessage({ type: 'export', sessionId: session.id, format: 'json' }));
 
@@ -1910,6 +2388,19 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         '">' +
           (dStatusLabel ? '<span class="status-dot" style="background:' + dStatusColor + ';"></span>' + escapeHtml(dStatusLabel) : 'Set status...') +
         '</button></div>';
+
+      const linkedTodos = allTodos.filter(t => (t.sessionIds || []).includes(session.id));
+      if (linkedTodos.length > 0) {
+        html += '<div class="detail-section"><h4>Linked TODOs (' + linkedTodos.length + ')</h4>' +
+          linkedTodos.map(t =>
+            '<div class="attached-session-row" data-tid="' + escapeHtml(t.id) + '">' +
+              '<span class="attached-title" title="' + escapeHtml(t.title) + '">' + escapeHtml(t.title) + '</span>' +
+              '<span class="todo-status-pill status-' + t.status + '" style="margin:0 4px;"><span class="status-dot"></span>' + escapeHtml(TODO_STATUS_LABELS[t.status] || t.status) + '</span>' +
+              '<button data-act="opentodo">Open</button>' +
+            '</div>'
+          ).join('') +
+          '</div>';
+      }
 
       const createdText = session.createdAt ? formatAbsoluteDate(session.createdAt) : '';
       const lastActiveText = session.lastMessageAt ? formatAbsoluteDate(session.lastMessageAt) : '';
@@ -2020,6 +2511,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       $('detailBody').querySelectorAll('.related-item').forEach(el => {
         el.addEventListener('click', () => {
           vscode.postMessage({ type: 'viewSession', sessionId: el.dataset.id });
+        });
+      });
+
+      // Linked TODOs - click "Open" to switch to TODOs tab and show detail.
+      $('detailBody').querySelectorAll('.attached-session-row[data-tid] button[data-act="opentodo"]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const row = btn.closest('.attached-session-row');
+          const tid = row?.getAttribute('data-tid');
+          if (!tid) return;
+          setActiveTab('todos');
+          openTodoDetail(tid);
         });
       });
     }
@@ -2134,6 +2637,267 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       div.textContent = str;
       return div.innerHTML;
     }
+
+    // ---------------------------------------------------------------------
+    // Tabs
+    // ---------------------------------------------------------------------
+    function setActiveTab(tab) {
+      activeTab = tab === 'todos' ? 'todos' : 'sessions';
+      const isTodos = activeTab === 'todos';
+      tabSessions.classList.toggle('active', !isTodos);
+      tabTodos.classList.toggle('active', isTodos);
+      tabSessions.setAttribute('aria-selected', String(!isTodos));
+      tabTodos.setAttribute('aria-selected', String(isTodos));
+      sessionsPanel.classList.toggle('active', !isTodos);
+      todosPanel.classList.toggle('active', isTodos);
+    }
+
+    tabSessions.addEventListener('click', () => setActiveTab('sessions'));
+    tabTodos.addEventListener('click', () => {
+      setActiveTab('todos');
+      // Ask backend for fresh todos when entering the tab.
+      vscode.postMessage({ type: 'requestTodos' });
+    });
+
+    // ---------------------------------------------------------------------
+    // TODOs
+    // ---------------------------------------------------------------------
+    const TODO_STATUS_LABELS = {
+      open: 'Open',
+      in_progress: 'In Progress',
+      done: 'Done',
+      archived: 'Archived',
+    };
+
+    function updateTodoTabCount() {
+      const active = allTodos.filter(t => t.status !== 'archived' && t.status !== 'done').length;
+      todoTabCount.textContent = String(active);
+    }
+
+    function getFilteredTodos() {
+      const q = todoSearchQuery.trim().toLowerCase();
+      return allTodos.filter(t => {
+        if (todoStatusFilter === 'active') {
+          if (t.status === 'archived' || t.status === 'done') return false;
+        } else if (todoStatusFilter !== 'all') {
+          if (t.status !== todoStatusFilter) return false;
+        }
+        if (!q) return true;
+        const hay = (t.title + ' ' + (t.notes || '')).toLowerCase();
+        return hay.includes(q);
+      });
+    }
+
+    function renderTodoList() {
+      const todos = getFilteredTodos();
+      todoListEl.innerHTML = '';
+
+      if (todos.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'state-msg';
+        const isSearching = todoSearchQuery.trim().length > 0 || todoStatusFilter !== 'active';
+        empty.innerHTML =
+          '<div class="state-icon">' + (isSearching ? '&#x1F50D;' : '&#x1F4DD;') + '</div>' +
+          '<h3>' + (isSearching ? 'No matching TODOs' : 'No TODOs yet') + '</h3>' +
+          '<p>' + (isSearching
+            ? 'Try a different filter or search term.'
+            : 'Click "+ New TODO" to add one. You can attach sessions to track related work.') + '</p>';
+        todoListEl.appendChild(empty);
+        renderTodoCounter(todos);
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      for (const todo of todos) {
+        fragment.appendChild(createTodoCard(todo));
+      }
+      todoListEl.appendChild(fragment);
+      renderTodoCounter(todos);
+    }
+
+    function renderTodoCounter(todos) {
+      if (!todoCounterRow) return;
+      const total = todos.length;
+      const open = todos.filter(t => t.status === 'open').length;
+      const wip = todos.filter(t => t.status === 'in_progress').length;
+      const done = todos.filter(t => t.status === 'done').length;
+      let html = '<span>' + total + ' TODO' + (total !== 1 ? 's' : '') + '</span>';
+      if (open > 0) html += '<span>' + open + ' open</span>';
+      if (wip > 0) html += '<span>' + wip + ' WIP</span>';
+      if (done > 0) html += '<span>' + done + ' done</span>';
+      todoCounterRow.innerHTML = html;
+    }
+
+    function createTodoCard(todo) {
+      const el = document.createElement('div');
+      el.className = 'todo-card status-' + todo.status;
+      el.setAttribute('tabindex', '0');
+      el.setAttribute('role', 'listitem');
+      el.setAttribute('data-todo-id', todo.id);
+
+      const status = todo.status || 'open';
+      const statusLabel = TODO_STATUS_LABELS[status] || status;
+      const sessCount = (todo.attachedSessions || todo.sessionIds || []).length;
+      const notes = todo.notes || '';
+
+      el.innerHTML =
+        '<div class="todo-card-header">' +
+          '<span class="todo-card-title">' + escapeHtml(todo.title) + '</span>' +
+          '<span class="todo-status-pill status-' + status + '"><span class="status-dot"></span>' + escapeHtml(statusLabel) + '</span>' +
+        '</div>' +
+        (notes ? '<div class="todo-card-notes">' + escapeHtml(notes) + '</div>' : '') +
+        '<div class="todo-card-meta">' +
+          '<span>' + sessCount + ' session' + (sessCount !== 1 ? 's' : '') + '</span>' +
+          '<span class="meta-dot">&#183;</span>' +
+          '<span>' + escapeHtml(formatRelativeTime(todo.updatedAt)) + '</span>' +
+        '</div>';
+
+      el.addEventListener('click', () => openTodoDetail(todo.id));
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openTodoDetail(todo.id);
+        }
+      });
+      return el;
+    }
+
+    function openTodoDetail(todoId) {
+      const todo = allTodos.find(t => t.id === todoId);
+      if (!todo) return;
+      openTodoId = todoId;
+      showTodoDetail(todo);
+    }
+
+    function showTodoDetail(todo) {
+      todoListView.style.display = 'none';
+      todoDetailView.classList.add('active');
+
+      todoDetailTitle.textContent = todo.title;
+
+      const status = todo.status || 'open';
+      const statusLabel = TODO_STATUS_LABELS[status] || status;
+
+      todoDetailActions.innerHTML =
+        '<button class="act-btn primary" id="tEditTitle">Rename</button>' +
+        '<button class="act-btn" id="tSetStatus">Status</button>' +
+        '<button class="act-btn" id="tAttach">+ Attach Session</button>' +
+        '<button class="act-btn danger" id="tDelete">Delete</button>';
+
+      const attached = todo.attachedSessions || (todo.sessionIds || []).map(id => ({ id, title: '(unknown session)' }));
+      let attachedHtml = '';
+      if (attached.length === 0) {
+        attachedHtml = '<div style="font-size:11px;color:var(--dim);">No sessions attached yet.</div>';
+      } else {
+        attachedHtml = attached.map(s =>
+          '<div class="attached-session-row" data-sid="' + escapeHtml(s.id) + '">' +
+            '<span class="attached-title" title="' + escapeHtml(s.title) + '">' + escapeHtml(s.title) + '</span>' +
+            '<button data-act="open">Open</button>' +
+            '<button data-act="view">View</button>' +
+            '<button class="danger" data-act="detach" title="Detach from TODO">&#x2715;</button>' +
+          '</div>'
+        ).join('');
+      }
+
+      const safeNotes = escapeHtml(todo.notes || '');
+
+      todoDetailBody.innerHTML =
+        '<div class="detail-section">' +
+          '<h4>Status</h4>' +
+          '<span class="todo-status-pill status-' + status + '"><span class="status-dot"></span>' + escapeHtml(statusLabel) + '</span>' +
+        '</div>' +
+        '<div class="detail-section">' +
+          '<h4>Notes</h4>' +
+          '<textarea class="todo-notes-editor" id="tNotes" placeholder="Add context, links, plans...">' + safeNotes + '</textarea>' +
+        '</div>' +
+        '<div class="detail-section">' +
+          '<h4>Attached Sessions (' + attached.length + ')</h4>' +
+          attachedHtml +
+        '</div>' +
+        '<div class="detail-section" style="font-size:11px;color:var(--dim);">' +
+          'Created ' + escapeHtml(formatRelativeTime(todo.createdAt)) +
+          ' &#183; Updated ' + escapeHtml(formatRelativeTime(todo.updatedAt)) +
+        '</div>';
+
+      // Wire actions
+      const tEditTitle = document.getElementById('tEditTitle');
+      const tSetStatus = document.getElementById('tSetStatus');
+      const tAttach = document.getElementById('tAttach');
+      const tDelete = document.getElementById('tDelete');
+      const tNotes = document.getElementById('tNotes');
+
+      tEditTitle.addEventListener('click', () => {
+        const next = window.prompt('Rename TODO', todo.title);
+        if (next !== null && next.trim().length > 0 && next !== todo.title) {
+          vscode.postMessage({ type: 'todoUpdate', todoId: todo.id, title: next.trim() });
+        }
+      });
+      tSetStatus.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoSetStatus', todoId: todo.id });
+      });
+      tAttach.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoAttachSession', todoId: todo.id });
+      });
+      tDelete.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoDelete', todoId: todo.id });
+      });
+
+      // Save notes on blur if changed
+      let lastNotes = todo.notes || '';
+      tNotes.addEventListener('blur', () => {
+        const v = tNotes.value;
+        if (v !== lastNotes) {
+          lastNotes = v;
+          vscode.postMessage({ type: 'todoUpdate', todoId: todo.id, notes: v });
+        }
+      });
+
+      // Attached session row actions
+      todoDetailBody.querySelectorAll('.attached-session-row').forEach(row => {
+        const sid = row.getAttribute('data-sid');
+        row.querySelectorAll('button').forEach(btn => {
+          btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const act = btn.getAttribute('data-act');
+            if (act === 'open') {
+              vscode.postMessage({ type: 'openSession', sessionId: sid });
+            } else if (act === 'view') {
+              setActiveTab('sessions');
+              vscode.postMessage({ type: 'viewSession', sessionId: sid });
+            } else if (act === 'detach') {
+              vscode.postMessage({ type: 'todoDetachSession', todoId: todo.id, sessionId: sid });
+            }
+          });
+        });
+      });
+    }
+
+    todoBackBtn.addEventListener('click', () => {
+      openTodoId = null;
+      todoDetailView.classList.remove('active');
+      todoListView.style.display = 'block';
+    });
+
+    newTodoBtn.addEventListener('click', () => {
+      const title = window.prompt('New TODO title');
+      if (title && title.trim().length > 0) {
+        vscode.postMessage({ type: 'todoCreate', title: title.trim() });
+      }
+    });
+
+    let todoSearchTimeout = null;
+    todoSearchInput.addEventListener('input', () => {
+      clearTimeout(todoSearchTimeout);
+      todoSearchTimeout = setTimeout(() => {
+        todoSearchQuery = todoSearchInput.value;
+        renderTodoList();
+      }, 150);
+    });
+
+    todoStatusFilterEl.addEventListener('change', () => {
+      todoStatusFilter = todoStatusFilterEl.value;
+      renderTodoList();
+    });
 
     vscode.postMessage({ type: 'ready' });
     } catch (e) {

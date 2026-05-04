@@ -119,11 +119,31 @@ export interface SessionGroup {
   color?: string;
 }
 
+export type TodoStatus = 'open' | 'in_progress' | 'done' | 'archived';
+
+export const TODO_STATUS_LABELS: Record<TodoStatus, string> = {
+  open: 'Open',
+  in_progress: 'In Progress',
+  done: 'Done',
+  archived: 'Archived',
+};
+
+export interface Todo {
+  id: string;
+  title: string;
+  notes?: string;
+  status: TodoStatus;
+  sessionIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface OverlayStore {
   version: number;
   sessions: Record<string, OverlayMetadata>;
   groups: Record<string, SessionGroup>;
   hiddenSessionIds?: string[];
+  todos?: Record<string, Todo>;
 }
 
 export type SessionSortField = 'lastMessageAt' | 'createdAt' | 'displayName' | 'messageCount';

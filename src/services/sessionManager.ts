@@ -62,6 +62,36 @@ export class SessionManager {
   }
 
   /**
+   * Returns todos sorted with non-archived first, then by recency. Each
+   * attached session id is enriched with a lightweight title so the webview
+   * can render attached-session lists without a second lookup.
+   */
+  async getTodosWithSessionTitles(): Promise<Array<import('../models/types').Todo & {
+    attachedSessions: { id: string; title: string }[];
+  }>> {
+    await this.ensureFresh();
+    const todos = this.overlay.getAllTodos();
+    const titleById = new Map<string, string>();
+    for (const s of this.cachedSessions) {
+      titleById.set(s.id, s.displayName);
+    }
+    const enriched = todos.map(t => ({
+      ...t,
+      attachedSessions: t.sessionIds.map(id => ({
+        id,
+        title: titleById.get(id) ?? '(unknown session)',
+      })),
+    }));
+    enriched.sort((a, b) => {
+      const aArch = a.status === 'archived' ? 1 : 0;
+      const bArch = b.status === 'archived' ? 1 : 0;
+      if (aArch !== bArch) { return aArch - bArch; }
+      return b.updatedAt - a.updatedAt;
+    });
+    return enriched;
+  }
+
+  /**
    * Full-text search over sessions.
    *
    * - `scope === 'title'` limits the haystack to identity/metadata fields
