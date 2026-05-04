@@ -25,6 +25,7 @@ export class OverlayStore {
         const parsed = JSON.parse(raw) as OverlayStoreData;
         if (parsed.version === CURRENT_VERSION) {
           this.migrateGitBranchToBranches(parsed);
+          this.migrateTodoWebexLink(parsed);
           return parsed;
         }
       }
@@ -32,6 +33,19 @@ export class OverlayStore {
       console.error('[OverlayStore] Failed to load:', err);
     }
     return { version: CURRENT_VERSION, sessions: {}, groups: {} };
+  }
+
+  private migrateTodoWebexLink(data: OverlayStoreData): void {
+    if (!data.todos) { return; }
+    for (const todo of Object.values(data.todos) as Array<Todo & { webexLink?: string }>) {
+      if (todo.webexLink && !todo.link) {
+        todo.link = todo.webexLink;
+      }
+      if ('webexLink' in todo) {
+        delete todo.webexLink;
+        this.dirty = true;
+      }
+    }
   }
 
   private migrateGitBranchToBranches(data: OverlayStoreData): void {
@@ -405,7 +419,7 @@ export class OverlayStore {
 
   async updateTodo(
     id: string,
-    patch: Partial<Pick<Todo, 'title' | 'notes' | 'status' | 'webexLink'>>,
+    patch: Partial<Pick<Todo, 'title' | 'notes' | 'status' | 'link'>>,
   ): Promise<void> {
     const todo = this.ensureTodos()[id];
     if (!todo) { return; }
@@ -418,9 +432,9 @@ export class OverlayStore {
     if (patch.status !== undefined) {
       todo.status = patch.status;
     }
-    if (patch.webexLink !== undefined) {
-      const trimmed = patch.webexLink.trim();
-      todo.webexLink = trimmed || undefined;
+    if (patch.link !== undefined) {
+      const trimmed = patch.link.trim();
+      todo.link = trimmed || undefined;
     }
     todo.updatedAt = Date.now();
     this.dirty = true;

@@ -134,7 +134,8 @@ export interface Todo {
   notes?: string;
   status: TodoStatus;
   sessionIds: string[];
-  webexLink?: string;
+  /** Quick-link URL (Webex, Slack, Zoom, GitHub PR, Confluence, etc.). */
+  link?: string;
   createdAt: number;
   updatedAt: number;
 }
