@@ -134,8 +134,12 @@ export interface Todo {
   notes?: string;
   status: TodoStatus;
   sessionIds: string[];
-  /** Quick-link URL (Webex, Slack, Zoom, GitHub PR, Confluence, etc.). */
-  link?: string;
+  /**
+   * Free-form quick links (Webex / Slack / Zoom / GitHub PR / Confluence /
+   * raw notes / anything). No format restrictions; non-URL values are
+   * stored as-is and best-effort opened via the OS.
+   */
+  links: string[];
   createdAt: number;
   updatedAt: number;
 }

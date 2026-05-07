@@ -15,22 +15,80 @@ import {
 const CODE_BLOCK_REGEX = /```[\s\S]*?```/g;
 const FILE_PATH_REGEX = /(?:^|\s)((?:\/|\.\/|~\/|[A-Z]:\\)[\w./-]+\.\w+)/gm;
 
+/**
+ * Payload for `SessionManager.onDidChange`.
+ *
+ * - `kind: 'patch'`: the overlay metadata for a single session changed and
+ *   `cachedSessions[id]` has already been re-merged in place. Consumers can
+ *   re-render just that one session without re-reading the DB.
+ * - `kind: 'remove'`: the session is no longer visible (e.g. just hidden).
+ *   Consumers should drop it from any UI list.
+ * - `kind: 'global'`: anything else (initial load, multi-session change,
+ *   group/link changes, restore deleted, etc.). Consumers should refresh
+ *   the whole list.
+ */
+export type SessionChange =
+  | { kind: 'patch'; sessionId: string; session: Session }
+  | { kind: 'remove'; sessionId: string }
+  | { kind: 'global' };
+
 export class SessionManager {
   private cachedSessions: Session[] = [];
+  private cachedRawById = new Map<string, CursorRawSession>();
   private lastRefresh = 0;
   private readonly CACHE_TTL_MS = 30_000;
 
-  private readonly _onDidChange = new vscode.EventEmitter<void>();
+  private readonly _onDidChange = new vscode.EventEmitter<SessionChange>();
   readonly onDidChange = this._onDidChange.event;
 
   constructor(
     private readonly dbReader: CursorDbReader,
     private readonly overlay: OverlayStore,
   ) {
-    overlay.onDidChange(() => {
+    overlay.onDidChange((sessionId) => {
+      // Per-session overlay change: try to re-merge in place so the webview
+      // can patch just that one card instead of re-rendering the whole list.
+      // Falls back to `global` (forces full refresh) when we can't safely
+      // patch (e.g., the session was hidden, or we don't have raw data
+      // cached yet because the initial load hasn't happened).
+      if (typeof sessionId === 'string') {
+        const change = this.applyOverlayPatch(sessionId);
+        if (change) {
+          this._onDidChange.fire(change);
+          return;
+        }
+      }
       this.invalidateCache();
-      this._onDidChange.fire();
+      this._onDidChange.fire({ kind: 'global' });
     });
+  }
+
+  /**
+   * Re-merge the overlay metadata for a single session into the cache so
+   * the next read sees the updated values, and return a typed change
+   * description so the caller can push a minimal patch to its UI. Returns
+   * `null` to signal "I can't safely patch, please do a global refresh"
+   * (raw not cached yet, session newly added, etc.).
+   */
+  private applyOverlayPatch(sessionId: string): SessionChange | null {
+    const raw = this.cachedRawById.get(sessionId);
+    if (!raw) {
+      return null;
+    }
+    const idx = this.cachedSessions.findIndex(s => s.id === sessionId);
+    if (this.overlay.isHidden(sessionId)) {
+      if (idx !== -1) { this.cachedSessions.splice(idx, 1); }
+      return { kind: 'remove', sessionId };
+    }
+    const meta = this.overlay.getMetadata(sessionId);
+    const merged = this.mergeSession(raw, meta);
+    if (idx === -1) {
+      // Was hidden, now isn't (or never appeared): safer to do a full
+      // refresh than guess where to insert.
+      return null;
+    }
+    this.cachedSessions[idx] = merged;
+    return { kind: 'patch', sessionId, session: merged };
   }
 
   async getSessions(options?: SessionListOptions): Promise<Session[]> {
@@ -146,16 +204,32 @@ export class SessionManager {
     return this.overlay.getAllTags();
   }
 
-  async refresh(): Promise<void> {
+  /**
+   * Re-read sessions from disk and refresh the in-memory cache.
+   *
+   * `silent: true` skips firing `onDidChange`. Use this from internal
+   * callers (`ensureFresh`) that already drive their own UI update path,
+   * so we don't fan out into a recursive `sendRefresh` while we're still
+   * inside one (which is what caused the double skeleton flash + double
+   * list re-render on every overlay mutation in older versions).
+   */
+  async refresh(silent = false): Promise<void> {
     const rawSessions = await this.dbReader.readAllSessions();
     const allMeta = this.overlay.getAllMetadata();
     const hidden = this.overlay.getHiddenIds();
+
+    this.cachedRawById.clear();
+    for (const raw of rawSessions) {
+      this.cachedRawById.set(raw.id, raw);
+    }
 
     this.cachedSessions = rawSessions
       .filter(raw => !hidden.has(raw.id))
       .map(raw => this.mergeSession(raw, allMeta[raw.id]));
     this.lastRefresh = Date.now();
-    this._onDidChange.fire();
+    if (!silent) {
+      this._onDidChange.fire({ kind: 'global' });
+    }
   }
 
   async exportSession(sessionId: string, format: 'markdown' | 'json'): Promise<string> {
@@ -177,10 +251,26 @@ export class SessionManager {
     this._onDidChange.dispose();
   }
 
+  /**
+   * In-flight refresh promise. Concurrent `ensureFresh` callers (e.g.
+   * the active-session poller and the user clicking refresh at the same
+   * moment) share this promise so we never run two parallel
+   * `readAllSessions()` passes — that wasted SQLite I/O and could land
+   * cache-replacement out of order.
+   */
+  private inFlightRefresh: Promise<void> | null = null;
+
   private async ensureFresh(): Promise<void> {
-    if (Date.now() - this.lastRefresh > this.CACHE_TTL_MS) {
-      await this.refresh();
+    if (Date.now() - this.lastRefresh <= this.CACHE_TTL_MS) {
+      return;
     }
+    if (this.inFlightRefresh) {
+      return this.inFlightRefresh;
+    }
+    this.inFlightRefresh = this.refresh(true).finally(() => {
+      this.inFlightRefresh = null;
+    });
+    return this.inFlightRefresh;
   }
 
   private mergeSession(raw: CursorRawSession, overlay?: { customName?: string; tags: string[]; pinned: boolean; status?: import('../models/types').SessionStatus; groupId?: string; relatedSessionIds: string[]; branches: string[]; notes?: string; jiraTicket?: string }): Session {

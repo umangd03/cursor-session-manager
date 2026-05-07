@@ -115,7 +115,22 @@ export class BackupService {
       log.info(`Backup: saved pre-restore snapshot as ${path.basename(preRestoreBackup)}`);
     }
 
-    fs.writeFileSync(this.sourceFile, raw, 'utf-8');
+    // Atomic write so an interrupted restore can never leave a truncated
+    // overlay file on disk: write to a sibling .tmp, fsync, then rename.
+    const tmpPath = `${this.sourceFile}.tmp.${process.pid}.${Date.now()}`;
+    const fd = fs.openSync(tmpPath, 'w');
+    try {
+      fs.writeSync(fd, raw, 0, 'utf-8');
+      try { fs.fsyncSync(fd); } catch { /* best effort */ }
+    } finally {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    try {
+      fs.renameSync(tmpPath, this.sourceFile);
+    } catch (err) {
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+      throw err;
+    }
     log.info(`Backup: restored from ${path.basename(backupPath)}`);
   }
 }

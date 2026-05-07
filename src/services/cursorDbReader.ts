@@ -115,40 +115,49 @@ export class CursorDbReader {
    * DB file was modified most recently. This lets us track Cursor's native
    * session selection in real time across multiple windows.
    */
+  /**
+   * Throws on DB / I/O failure so the polling loop's consecutive-failure
+   * backoff at the call site can actually engage. Earlier versions caught
+   * here and returned `undefined`, which made all errors look like "no
+   * active session" and prevented the back-off from ever tripping when
+   * Cursor's DBs were transiently locked or sqlite3 was missing.
+   */
   async getActiveSessionId(currentFolderPaths: string[]): Promise<string | undefined> {
-    try {
-      const workspaces = this.getAvailableWorkspaces();
-      if (workspaces.length === 0) { return undefined; }
+    const workspaces = this.getAvailableWorkspaces();
+    if (workspaces.length === 0) { return undefined; }
 
-      const normalized = new Set(currentFolderPaths.map(p => path.resolve(p)));
-      const matching = normalized.size > 0
-        ? workspaces.filter(w => w.folderPath && normalized.has(path.resolve(w.folderPath)))
-        : [];
+    const normalized = new Set(currentFolderPaths.map(p => path.resolve(p)));
+    const matching = normalized.size > 0
+      ? workspaces.filter(w => w.folderPath && normalized.has(path.resolve(w.folderPath)))
+      : [];
 
-      const candidates = matching.length > 0 ? matching : workspaces.slice(0, 1);
-      candidates.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
+    const candidates = matching.length > 0 ? matching : workspaces.slice(0, 1);
+    candidates.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
 
-      for (const ws of candidates) {
-        const id = await this.readActiveFromWorkspaceDb(ws.dbPath);
-        if (id) { return id; }
-      }
-      return undefined;
-    } catch (err) {
-      log.error('getActiveSessionId failed', err);
-      return undefined;
+    for (const ws of candidates) {
+      const id = await this.readActiveFromWorkspaceDb(ws.dbPath);
+      if (id) { return id; }
     }
+    return undefined;
   }
 
+  /**
+   * Polled every couple of seconds, so we deliberately avoid sql.js here:
+   * its WASM heap fragments under repeated `new SQL.Database(buffer)` /
+   * `db.close()` cycles and eventually traps with `Aborted(OOM)` /
+   * `RangeError: Array buffer allocation failed` /
+   * `trap: invalid memory.fill` after a few thousand polls. Once that
+   * happens the heap stays corrupted for the lifetime of the extension
+   * host and active-session highlighting silently dies. The sqlite3 CLI
+   * spawns a fresh process each call, so any leak is bounded to that
+   * process and reclaimed on exit.
+   */
   private async readActiveFromWorkspaceDb(dbPath: string): Promise<string | undefined> {
-    let db: Database | null = null;
+    // Active polling: keep the timeout aggressive so a slow/locked DB
+    // doesn't accumulate child processes when ticks pile up.
+    const rawValue = await this.queryLargeDb(dbPath, 'composer.composerData', { timeoutMs: 3000 });
+    if (!rawValue) { return undefined; }
     try {
-      const SQL = await getSql();
-      const buffer = fs.readFileSync(dbPath);
-      db = new SQL.Database(buffer);
-      const results = db.exec("SELECT value FROM ItemTable WHERE key = 'composer.composerData'");
-      if (!results.length || !results[0].values.length) { return undefined; }
-      const rawValue = results[0].values[0][0];
-      if (typeof rawValue !== 'string') { return undefined; }
       const data = JSON.parse(rawValue);
       const ids = data?.lastFocusedComposerIds;
       if (Array.isArray(ids) && ids.length > 0 && typeof ids[0] === 'string') {
@@ -156,10 +165,7 @@ export class CursorDbReader {
       }
       return undefined;
     } catch (err) {
-      log.error('readActiveFromWorkspaceDb failed', err);
-      return undefined;
-    } finally {
-      try { db?.close(); } catch { /* ignore */ }
+      throw new Error(`Failed to parse composer.composerData from ${path.basename(path.dirname(dbPath))}: ${String(err)}`);
     }
   }
 
@@ -198,16 +204,44 @@ export class CursorDbReader {
     }
   }
 
-  private async queryLargeDb(dbPath: string, key: string): Promise<string | undefined> {
+  /**
+   * Run a single-row sqlite3 CLI query.
+   *
+   * `timeoutMs` is honored by `child_process.execFile`'s built-in timeout
+   * (the child gets SIGTERM, then SIGKILL if it ignores SIGTERM). Without
+   * this, a held SQLite lock from another Cursor process could pin our
+   * polling loop indefinitely and pile up child processes on every tick.
+   *
+   * NOTE on injection: `key` is callsite-controlled (we only pass
+   * hardcoded composer keys), so the in-line concatenation is safe.
+   * `dbPath` is passed as a separate argv entry, not interpolated into a
+   * shell, so it's also safe.
+   *
+   * Errors are thrown so callers can decide whether to swallow (batch
+   * reads) or propagate (active polling backoff).
+   */
+  private async queryLargeDb(
+    dbPath: string,
+    key: string,
+    opts: { timeoutMs?: number; swallow?: boolean } = {},
+  ): Promise<string | undefined> {
+    const timeoutMs = opts.timeoutMs ?? 30_000;
     try {
       const { stdout } = await execFileAsync('sqlite3', [
         dbPath,
         `SELECT value FROM ItemTable WHERE key = '${key}'`,
-      ], { maxBuffer: 50 * 1024 * 1024 });
+      ], {
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: timeoutMs,
+        killSignal: 'SIGKILL',
+      });
       return stdout.trim() || undefined;
     } catch (err) {
-      log.error(`sqlite3 CLI query failed for ${key}`, err);
-      return undefined;
+      if (opts.swallow) {
+        log.error(`sqlite3 CLI query failed for ${key}`, err);
+        return undefined;
+      }
+      throw err;
     }
   }
 

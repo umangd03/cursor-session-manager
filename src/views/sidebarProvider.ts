@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { SessionManager } from '../services/sessionManager';
+import { SessionManager, SessionChange } from '../services/sessionManager';
 import { OverlayStore } from '../services/overlayStore';
 import { openSession, openSessionAsDocument } from '../services/sessionOpener';
 import { Session } from '../models/types';
@@ -13,14 +13,64 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
   private currentWorkspaceOnly = false;
   private activePollTimer?: NodeJS.Timeout;
   private currentActiveSessionId?: string;
+  private activePollConsecutiveFailures = 0;
+  /**
+   * Guard against polling re-entry. The DB read can take longer than the
+   * poll interval (especially when sqlite3 is briefly contended), and
+   * without a guard `setInterval` would spawn a new child process every
+   * 2s while the previous one hadn't finished, fanning out tens of
+   * processes and pushing CPU through the roof.
+   */
+  private activePollInFlight = false;
   private readonly ACTIVE_POLL_INTERVAL_MS = 2000;
+  private readonly ACTIVE_POLL_MAX_FAILURES = 10;
+
+  /**
+   * Disposables we own (event subscriptions registered against
+   * collaborators). Tracked so `dispose()` can drop our listeners and
+   * avoid leaks across reload-window cycles.
+   */
+  private disposables: vscode.Disposable[] = [];
+  /** Disposables tied to the lifetime of one resolved webview view. */
+  private viewDisposables: vscode.Disposable[] = [];
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly sessionManager: SessionManager,
     private readonly overlay: OverlayStore,
   ) {
-    sessionManager.onDidChange(() => this.sendRefresh());
+    this.disposables.push(
+      sessionManager.onDidChange((change) => this.handleSessionChange(change)),
+    );
+  }
+
+  /**
+   * React to overlay-driven changes without a full sidebar reload when we
+   * can. The webview keeps its scroll position and any expanded UI state,
+   * which avoids the "entire page refreshes on every status change" UX
+   * complaint.
+   */
+  private handleSessionChange(change: SessionChange): void {
+    if (!this.view) { return; }
+    if (change.kind === 'patch') {
+      this.view.webview.postMessage({
+        type: 'sessionPatch',
+        session: change.session,
+        tags: this.sessionManager.getAllTags(),
+        todoCountBySession: this.buildTodoCountBySession(),
+      });
+      return;
+    }
+    if (change.kind === 'remove') {
+      this.view.webview.postMessage({
+        type: 'sessionRemove',
+        sessionId: change.sessionId,
+        tags: this.sessionManager.getAllTags(),
+        hiddenCount: this.overlay.getHiddenCount(),
+      });
+      return;
+    }
+    void this.sendRefresh();
   }
 
   private getCurrentWorkspacePath(): string | undefined {
@@ -45,9 +95,64 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.getHtml(webviewView.webview);
     log.info('webview HTML set');
 
-    webviewView.webview.onDidReceiveMessage(async (msg) => {
-      log.info(`webview message received: ${msg.type}`);
-      switch (msg.type) {
+    this.viewDisposables.push(webviewView.webview.onDidReceiveMessage(async (msg) => {
+      // Top-level guard: a malformed payload, an unhandled rejection
+      // inside a handler, or an exception thrown from VS Code APIs
+      // should never crash the message loop or leave the user staring
+      // at a half-applied operation. Log it loudly so we can debug,
+      // and surface a non-fatal toast.
+      try {
+        if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') {
+          log.error('webview message rejected: malformed payload');
+          return;
+        }
+        log.info(`webview message received: ${msg.type}`);
+        await this.dispatchWebviewMessage(msg);
+      } catch (err) {
+        log.error(`webview message handler threw for type=${msg?.type ?? '<unknown>'}`, err);
+        const detail = err instanceof Error ? err.message : String(err);
+        void vscode.window.showErrorMessage(
+          `Cursor Session Manager: ${msg?.type ?? 'message'} failed: ${detail}`,
+        );
+      }
+    }));
+
+    this.configDisposable?.dispose();
+    this.configDisposable = vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('cursorSessions.jiraBaseUrl')) {
+        void this.sendRefresh();
+      }
+    });
+
+    if (webviewView.visible) {
+      this.startActiveSessionPolling();
+    }
+    // Drop our background work whenever the user collapses the sidebar
+    // or switches activity bar tabs — otherwise we'd keep hitting Cursor's
+    // SQLite databases for a view nobody's looking at, which is both
+    // wasted I/O and a real source of file-locking contention with the
+    // host Cursor process.
+    this.viewDisposables.push(
+      webviewView.onDidChangeVisibility(() => {
+        if (webviewView.visible) {
+          this.startActiveSessionPolling();
+        } else {
+          this.stopActiveSessionPolling();
+        }
+      }),
+    );
+    this.viewDisposables.push(
+      webviewView.onDidDispose(() => {
+        this.stopActiveSessionPolling();
+        this.disposeViewSubscriptions();
+        this.view = undefined;
+      }),
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async dispatchWebviewMessage(msg: any): Promise<void> {
+    switch (msg.type) {
         case 'ready':
           await this.sendRefresh();
           break;
@@ -157,17 +262,20 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'todoQuickCreateForSession':
           await this.handleTodoQuickCreateForSession(msg.sessionId);
           break;
-        case 'todoSetLink':
-          await this.handleTodoSetLink(msg.todoId);
+        case 'todoAddLink':
+          await this.handleTodoAddLink(msg.todoId);
           break;
-        case 'todoClearLink':
-          if (typeof msg.todoId === 'string' && msg.todoId.length > 0) {
-            await this.overlay.updateTodo(msg.todoId, { link: '' });
+        case 'todoEditLinkAt':
+          await this.handleTodoEditLinkAt(msg.todoId, msg.index);
+          break;
+        case 'todoRemoveLinkAt':
+          if (typeof msg.todoId === 'string' && typeof msg.index === 'number') {
+            await this.overlay.removeTodoLinkAt(msg.todoId, msg.index);
           }
           break;
         case 'todoOpenLink':
           if (typeof msg.url === 'string' && msg.url.length > 0) {
-            await vscode.env.openExternal(vscode.Uri.parse(msg.url));
+            await this.openLinkBestEffort(msg.url);
           }
           break;
         case 'attachSessionToTodo':
@@ -176,25 +284,27 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         case 'requestTodos':
           await this.sendTodos();
           break;
+        default:
+          log.error(`webview message dispatcher: unknown type=${String(msg.type)}`);
+          break;
       }
-    });
-
-    this.configDisposable?.dispose();
-    this.configDisposable = vscode.workspace.onDidChangeConfiguration(e => {
-      if (e.affectsConfiguration('cursorSessions.jiraBaseUrl')) {
-        void this.sendRefresh();
-      }
-    });
-
-    this.startActiveSessionPolling();
-    webviewView.onDidDispose(() => this.stopActiveSessionPolling());
   }
 
   private configDisposable?: vscode.Disposable;
 
+  private disposeViewSubscriptions(): void {
+    for (const d of this.viewDisposables.splice(0)) {
+      try { d.dispose(); } catch { /* ignore individual failures */ }
+    }
+  }
+
   dispose(): void {
     this.configDisposable?.dispose();
     this.stopActiveSessionPolling();
+    this.disposeViewSubscriptions();
+    for (const d of this.disposables.splice(0)) {
+      try { d.dispose(); } catch { /* ignore individual failures */ }
+    }
   }
 
   private startActiveSessionPolling(): void {
@@ -211,46 +321,91 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       clearInterval(this.activePollTimer);
       this.activePollTimer = undefined;
     }
+    // Don't reset activePollInFlight; the in-flight call still has to
+    // resolve before we let another start.
   }
 
   private async pollActiveSession(): Promise<void> {
     if (!this.view) { return; }
+    if (this.activePollInFlight) {
+      // Previous tick is still talking to sqlite3; skip this one rather
+      // than fanning out a parallel child process.
+      return;
+    }
+    this.activePollInFlight = true;
     try {
       const folders = vscode.workspace.workspaceFolders ?? [];
       const folderPaths = folders.map(f => f.uri.fsPath);
       const activeId = await this.sessionManager.getActiveSessionId(folderPaths);
+      this.activePollConsecutiveFailures = 0;
+      if (!this.view) { return; }
       if (activeId !== this.currentActiveSessionId) {
         this.currentActiveSessionId = activeId;
         this.view.webview.postMessage({ type: 'activeSession', sessionId: activeId ?? null });
       }
     } catch (err) {
-      log.error('pollActiveSession failed', err);
+      this.activePollConsecutiveFailures += 1;
+      // Log only the first few; otherwise we drown the output channel and
+      // make the real startup/sendRefresh log lines impossible to find.
+      if (this.activePollConsecutiveFailures <= 3) {
+        log.error('pollActiveSession failed', err);
+      }
+      if (this.activePollConsecutiveFailures === this.ACTIVE_POLL_MAX_FAILURES) {
+        log.error(
+          `pollActiveSession: giving up after ${this.ACTIVE_POLL_MAX_FAILURES} consecutive failures; ` +
+          'active-session highlighting disabled until extension reload',
+        );
+        this.stopActiveSessionPolling();
+      }
+    } finally {
+      this.activePollInFlight = false;
     }
   }
 
+  /**
+   * Track whether we've shipped at least one successful `sessions` payload
+   * to the webview. After that, subsequent refreshes shouldn't flash the
+   * skeleton — the webview already has data on screen and the user just
+   * wants the new values to appear.
+   */
+  private hasSentInitialSessions = false;
+  /**
+   * Monotonically increasing request id for sendRefresh. If a newer
+   * refresh is started while an older one is still in flight, the older
+   * one will see `requestId !== this.refreshSequence` when it finishes
+   * and silently drop its payload instead of overwriting fresher data.
+   */
+  private refreshSequence = 0;
+
   private async sendRefresh(): Promise<void> {
     if (!this.view) { return; }
-    this.view.webview.postMessage({ type: 'loading' });
+    const requestId = ++this.refreshSequence;
+    if (!this.hasSentInitialSessions) {
+      this.view.webview.postMessage({ type: 'loading' });
+    }
     try {
-      log.info('sendRefresh: fetching sessions...');
+      log.info(`sendRefresh[#${requestId}]: fetching sessions...`);
       const filter: import('../models/types').SessionFilter = {};
       if (this.currentWorkspaceOnly) {
         filter.workspacePath = this.getCurrentWorkspacePath();
       }
       const sessions = await this.sessionManager.getSessions({ filter });
-      log.info(`sendRefresh: got ${sessions.length} sessions`);
+      if (requestId !== this.refreshSequence) {
+        log.info(`sendRefresh[#${requestId}]: stale (latest is #${this.refreshSequence}); dropping`);
+        return;
+      }
+      log.info(`sendRefresh[#${requestId}]: got ${sessions.length} sessions`);
       const tags = this.sessionManager.getAllTags();
       const groups = await this.sessionManager.getGroups();
-      const wsPath = this.getCurrentWorkspacePath();
-      log.info(`sendRefresh: posting to webview (${tags.length} tags, ${groups.length} groups)`);
-      const hiddenCount = this.overlay.getHiddenCount();
-      const todoCountBySession: Record<string, number> = {};
-      for (const t of this.overlay.getAllTodos()) {
-        if (t.status === 'archived') { continue; }
-        for (const sid of t.sessionIds) {
-          todoCountBySession[sid] = (todoCountBySession[sid] ?? 0) + 1;
-        }
+      if (requestId !== this.refreshSequence) {
+        log.info(`sendRefresh[#${requestId}]: stale after groups; dropping`);
+        return;
       }
+      const wsPath = this.getCurrentWorkspacePath();
+      log.info(`sendRefresh[#${requestId}]: posting to webview (${tags.length} tags, ${groups.length} groups)`);
+      const hiddenCount = this.overlay.getHiddenCount();
+      const todoCountBySession = this.buildTodoCountBySession();
+      if (!this.view) { return; }
       this.view.webview.postMessage({
         type: 'sessions', sessions, tags, groups,
         workspaceOnly: this.currentWorkspaceOnly,
@@ -260,11 +415,14 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         activeSessionId: this.currentActiveSessionId ?? null,
         todoCountBySession,
       });
+      this.hasSentInitialSessions = true;
       await this.sendTodos();
-      log.info('sendRefresh: done');
+      log.info(`sendRefresh[#${requestId}]: done`);
     } catch (err) {
-      log.error('sendRefresh failed', err);
-      this.view.webview.postMessage({ type: 'error', message: String(err) });
+      log.error(`sendRefresh[#${requestId}] failed`, err);
+      if (this.view && requestId === this.refreshSequence) {
+        this.view.webview.postMessage({ type: 'error', message: String(err) });
+      }
     }
   }
 
@@ -423,36 +581,65 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     await this.overlay.createTodo(title.trim(), undefined, sid ? [sid] : []);
   }
 
-  private async handleTodoSetLink(todoId: unknown): Promise<void> {
+  private async handleTodoAddLink(todoId: unknown): Promise<void> {
     if (typeof todoId !== 'string' || !todoId) { return; }
-    const todo = this.overlay.getTodo(todoId);
-    if (!todo) { return; }
-    const url = await vscode.window.showInputBox({
-      prompt: 'Quick link for this TODO',
-      placeHolder: 'Webex / Slack / Zoom / GitHub PR / Confluence …',
-      value: todo.link ?? '',
-      validateInput: (v) => {
-        const trimmed = v.trim();
-        if (!trimmed) { return null; }
-        try {
-          const parsed = new URL(trimmed);
-          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-            return 'Link must use http:// or https://';
-          }
-        } catch {
-          return 'Enter a valid URL';
-        }
-        return null;
-      },
+    const value = await vscode.window.showInputBox({
+      prompt: 'Add a link or reference',
+      placeHolder: 'Webex / Slack / Zoom / GitHub PR / any text or URL',
     });
-    if (url === undefined) { return; }
-    await this.overlay.updateTodo(todoId, { link: url });
+    if (value === undefined) { return; }
+    const trimmed = value.trim();
+    if (!trimmed) { return; }
+    await this.overlay.addTodoLink(todoId, trimmed);
   }
 
-  private async handleSearch(query: string, scope?: unknown): Promise<void> {
+  private async handleTodoEditLinkAt(todoId: unknown, index: unknown): Promise<void> {
+    if (typeof todoId !== 'string' || !todoId) { return; }
+    if (typeof index !== 'number') { return; }
+    const todo = this.overlay.getTodo(todoId);
+    if (!todo || !Array.isArray(todo.links)) { return; }
+    const current = todo.links[index];
+    if (current === undefined) { return; }
+    const value = await vscode.window.showInputBox({
+      prompt: 'Edit link (leave blank to remove)',
+      value: current,
+    });
+    if (value === undefined) { return; }
+    await this.overlay.updateTodoLinkAt(todoId, index, value);
+  }
+
+  /**
+   * Best-effort open: try VS Code's external opener (which works for any URL
+   * scheme it recognizes). If parsing fails or the OS rejects it, surface a
+   * non-fatal info message and leave the entry intact for manual copy.
+   */
+  private async openLinkBestEffort(value: string): Promise<void> {
+    const trimmed = value.trim();
+    if (!trimmed) { return; }
+    try {
+      const uri = vscode.Uri.parse(trimmed, true);
+      const ok = await vscode.env.openExternal(uri);
+      if (!ok) {
+        await vscode.env.clipboard.writeText(trimmed);
+        void vscode.window.showInformationMessage(
+          `Could not open "${trimmed}". Copied to clipboard.`,
+        );
+      }
+    } catch {
+      await vscode.env.clipboard.writeText(trimmed);
+      void vscode.window.showInformationMessage(
+        `"${trimmed}" is not a recognizable URL. Copied to clipboard.`,
+      );
+    }
+  }
+
+  private async handleSearch(query: unknown, scope?: unknown): Promise<void> {
     if (!this.view) { return; }
+    // Tolerate any payload shape from the webview: a non-string query
+    // would throw deep in `String#includes()` inside `SessionManager`.
+    const normalizedQuery = typeof query === 'string' ? query : '';
     const normalizedScope: 'title' | 'all' = scope === 'title' ? 'title' : 'all';
-    const results = await this.sessionManager.searchSessions(query, normalizedScope);
+    const results = await this.sessionManager.searchSessions(normalizedQuery, normalizedScope);
     const tags = this.sessionManager.getAllTags();
     this.view.webview.postMessage({
       type: 'sessions',
@@ -790,7 +977,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     .panel { display: none; }
     .panel.active { display: block; }
     .panel .toolbar { top: 32px; } /* sit below the tab bar when sticky */
-    .panel .detail-header { top: 32px; } /* same for detail header */
+    /* When showing a detail view, hide the list toolbar so it doesn't waste
+       vertical space and so the sticky detail-header doesn't fight with the
+       sticky toolbar for the same top:32px slot. */
+    .panel.in-detail > .toolbar { display: none; }
 
     /* --- Toolbar --- */
     .toolbar {
@@ -1233,20 +1423,28 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     .session-card:focus-within .card-actions,
     .session-card:focus-visible .card-actions { display: flex; }
     .act-btn {
+      -webkit-appearance: none;
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       font-size: 10.5px;
+      line-height: 1.2;
       padding: 3px 8px;
       border-radius: 4px;
       border: 1px solid var(--border);
       background: none;
-      color: var(--dim);
+      color: var(--dim, var(--fg));
       cursor: pointer;
       transition: all 0.12s;
       font-family: inherit;
+      text-indent: 0;
+      white-space: nowrap;
     }
     .act-btn:hover { color: var(--fg); background: var(--hover-bg); border-color: var(--dim); }
-    .act-btn.primary { background: rgba(128,128,128,0.08); color: var(--fg); font-weight: 500; }
+    .act-btn.primary { background: rgba(128,128,128,0.08); color: var(--fg, currentColor); font-weight: 500; }
     .act-btn.primary:hover { background: rgba(128,128,128,0.18); }
-    .act-btn.danger { color: var(--error); }
+    .act-btn.danger { color: var(--error, var(--fg)); }
     .act-btn.danger:hover { background: rgba(241,76,76,0.1); border-color: var(--error); }
 
     /* --- Restore banner --- */
@@ -1557,7 +1755,9 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       border-radius: 4px;
       background: var(--hover-bg);
       font-size: 11.5px;
+      margin-bottom: 4px;
     }
+    .link-row:last-of-type { margin-bottom: 4px; }
     .link-icon { flex-shrink: 0; }
     .link-anchor {
       flex: 1;
@@ -1580,7 +1780,8 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       font-family: inherit;
       flex-shrink: 0;
     }
-    .link-action:hover { color: var(--error); border-color: var(--error); }
+    .link-action:hover { color: var(--fg); border-color: var(--fg); }
+    .link-action[data-act="remove"]:hover { color: var(--error); border-color: var(--error); }
 
     /* Linked-TODO indicator on session cards */
     .session-todo-badge {
@@ -1634,10 +1835,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
     .detail-actions {
       display: flex;
+      flex-wrap: wrap;
       gap: 6px;
       padding: 10px 12px;
     }
-    .detail-actions .act-btn { flex: 1; padding: 6px 10px; text-align: center; justify-content: center; display: flex; }
+    .detail-actions .act-btn {
+      flex: 0 0 auto;
+      max-width: 100%;
+      min-height: 28px;
+      padding: 6px 10px;
+      text-align: center;
+      overflow: visible;
+    }
 
     .detail-body { padding: 0 12px 16px; }
 
@@ -1925,6 +2134,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     const cancelSelectBtn = $('cancelSelectBtn');
     const scopeTitleBtn = $('scopeTitleBtn');
     const scopeAllBtn = $('scopeAllBtn');
+    const viewToggleBtn = $('viewToggleBtn');
 
     const tabSessions = $('tabSessions');
     const tabTodos = $('tabTodos');
@@ -1962,8 +2172,10 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
     function applyViewUI() {
       document.body.classList.toggle('minimal-mode', minimalView);
-      viewToggleBtn.innerHTML = minimalView ? '&#x229F;' : '&#x2261;'; // Change icon based on mode
-      viewToggleBtn.title = minimalView ? 'Switch to Detailed View' : 'Switch to Minimal View';
+      if (viewToggleBtn) {
+        viewToggleBtn.innerHTML = minimalView ? '&#x229F;' : '&#x2261;';
+        viewToggleBtn.title = minimalView ? 'Switch to Detailed View' : 'Switch to Minimal View';
+      }
     }
 
     function persistState() {
@@ -1983,11 +2195,13 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    viewToggleBtn.addEventListener('click', () => {
-      minimalView = !minimalView;
-      applyViewUI();
-      persistState();
-    });
+    if (viewToggleBtn) {
+      viewToggleBtn.addEventListener('click', () => {
+        minimalView = !minimalView;
+        applyViewUI();
+        persistState();
+      });
+    }
 
     scopeTitleBtn.addEventListener('click', () => setScope('title'));
     scopeAllBtn.addEventListener('click', () => setScope('all'));
@@ -2069,16 +2283,56 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     backBtn.addEventListener('click', () => {
       detailView.classList.remove('active');
       listView.style.display = 'block';
+      document.getElementById('sessionsPanel')?.classList.remove('in-detail');
     });
+
+    // Safety net: if the extension host ever fails to respond after sending
+    // the initial 'loading' (e.g., sql.js heap corrupted, stuck async, etc.)
+    // we don't want the user staring at the skeleton forever with no idea
+    // what's wrong. Show a recoverable error after a generous timeout.
+    let loadingTimeoutId = null;
+    const LOADING_TIMEOUT_MS = 30000;
+    function clearLoadingTimeout() {
+      if (loadingTimeoutId !== null) {
+        clearTimeout(loadingTimeoutId);
+        loadingTimeoutId = null;
+      }
+    }
+    function scheduleLoadingTimeout() {
+      clearLoadingTimeout();
+      loadingTimeoutId = setTimeout(() => {
+        loadingTimeoutId = null;
+        if (loadingState.style.display === 'none') { return; }
+        loadingState.style.display = 'none';
+        refreshBtn.classList.remove('spinning');
+        sessionList.innerHTML =
+          '<div class="state-msg error">' +
+            '<div class="state-icon">&#x26A0;</div>' +
+            '<h3>Sessions taking too long to load</h3>' +
+            '<p>The extension didn\\'t respond within 30s. ' +
+            'Try clicking refresh, or run "Developer: Reload Window" if it persists.</p>' +
+            '<button class="act-btn primary" id="loadingRetry" style="margin-top:10px;">Retry</button>' +
+          '</div>';
+        const retry = document.getElementById('loadingRetry');
+        if (retry) {
+          retry.addEventListener('click', () => {
+            refreshBtn.classList.add('spinning');
+            vscode.postMessage({ type: 'refresh' });
+          });
+        }
+      }, LOADING_TIMEOUT_MS);
+    }
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
 
       if (msg.type === 'loading') {
         loadingState.style.display = 'flex';
+        scheduleLoadingTimeout();
       }
 
       if (msg.type === 'error') {
+        clearLoadingTimeout();
         loadingState.style.display = 'none';
         refreshBtn.classList.remove('spinning');
         sessionList.innerHTML =
@@ -2095,6 +2349,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       }
 
       if (msg.type === 'sessions') {
+        clearLoadingTimeout();
         loadingState.style.display = 'none';
         refreshBtn.classList.remove('spinning');
         allSessions = msg.sessions || [];
@@ -2137,6 +2392,16 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         showDetail(msg.session, msg.related || []);
       }
 
+      if (msg.type === 'sessionPatch') {
+        applySessionPatch(msg.session, msg.todoCountBySession);
+        if (Array.isArray(msg.tags)) { renderTags(msg.tags); }
+      }
+
+      if (msg.type === 'sessionRemove') {
+        applySessionRemove(msg.sessionId, msg.hiddenCount);
+        if (Array.isArray(msg.tags)) { renderTags(msg.tags); }
+      }
+
       if (msg.type === 'todos') {
         allTodos = Array.isArray(msg.todos) ? msg.todos : [];
         updateTodoTabCount();
@@ -2149,6 +2414,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
             openTodoId = null;
             todoDetailView.classList.remove('active');
             todoListView.style.display = 'block';
+            document.getElementById('todosPanel')?.classList.remove('in-detail');
           }
         }
       }
@@ -2212,6 +2478,68 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         const isActive = !!activeSessionId && id === activeSessionId;
         card.classList.toggle('active', isActive);
       });
+    }
+
+    /**
+     * In-place patch: swap one card's DOM without touching the rest of the
+     * list, preserving scroll position and any other transient UI state.
+     * Falls back to a full re-render when the change affects sort order
+     * (currently: pin toggle) or when the card isn't in the DOM yet.
+     */
+    function applySessionPatch(updated, todoCounts) {
+      if (!updated || !updated.id) { return; }
+      if (todoCounts && typeof todoCounts === 'object') {
+        todoCountBySession = todoCounts;
+      }
+      const idx = allSessions.findIndex(s => s.id === updated.id);
+      if (idx === -1) {
+        // Not in our visible list (e.g. filtered out, or just unhid): defer
+        // to a full refresh so positioning stays correct.
+        vscode.postMessage({ type: 'refresh' });
+        return;
+      }
+      const prev = allSessions[idx];
+      allSessions[idx] = updated;
+
+      const reorderRequired = prev.pinned !== updated.pinned;
+      if (reorderRequired) {
+        renderSessions(allSessions);
+        renderCounter(allSessions);
+        return;
+      }
+
+      const card = sessionList.querySelector(
+        '.session-card[data-session-id="' + cssEscape(updated.id) + '"]',
+      );
+      if (!card) {
+        renderSessions(allSessions);
+        renderCounter(allSessions);
+        return;
+      }
+      const fresh = createSessionCard(updated);
+      // Suppress the entrance animation so the card doesn't flash on patch.
+      fresh.style.animation = 'none';
+      card.replaceWith(fresh);
+      renderCounter(allSessions);
+    }
+
+    function applySessionRemove(sessionId, hiddenCount) {
+      if (!sessionId) { return; }
+      const idx = allSessions.findIndex(s => s.id === sessionId);
+      if (idx !== -1) { allSessions.splice(idx, 1); }
+      selectedIds.delete(sessionId);
+      const card = sessionList.querySelector(
+        '.session-card[data-session-id="' + cssEscape(sessionId) + '"]',
+      );
+      if (card) { card.remove(); }
+      renderCounter(allSessions);
+      updateSelectBar();
+      if (typeof hiddenCount === 'number') {
+        renderRestoreBanner(hiddenCount);
+      }
+      if (allSessions.length === 0) {
+        renderSessions(allSessions);
+      }
     }
 
     function renderSessions(sessions) {
@@ -2451,6 +2779,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     function showDetail(session, related) {
       listView.style.display = 'none';
       detailView.classList.add('active');
+      document.getElementById('sessionsPanel')?.classList.add('in-detail');
 
       $('detailTitle').textContent = session.displayName;
 
@@ -2860,12 +3189,15 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       const statusLabel = TODO_STATUS_LABELS[status] || status;
       const sessCount = (todo.attachedSessions || todo.sessionIds || []).length;
       const notes = todo.notes || '';
-      const hasLink = !!(todo.link && todo.link.trim().length > 0);
+      const links = Array.isArray(todo.links) ? todo.links.filter(l => typeof l === 'string' && l.trim().length > 0) : [];
+      const linkCount = links.length;
+      const chipTitle = linkCount === 1 ? links[0] : (linkCount + ' link' + (linkCount !== 1 ? 's' : ''));
+      const chipLabel = linkCount > 1 ? '&#x1F517; ' + linkCount : '&#x1F517;';
 
       el.innerHTML =
         '<div class="todo-card-header">' +
           '<span class="todo-card-title">' + escapeHtml(todo.title) + '</span>' +
-          (hasLink ? '<button class="link-chip" data-action="openLink" title="' + escapeHtml(todo.link) + '">&#x1F517;</button>' : '') +
+          (linkCount > 0 ? '<button class="link-chip" data-action="openFirstLink" title="' + escapeHtml(chipTitle) + '">' + chipLabel + '</button>' : '') +
           '<span class="todo-status-pill status-' + status + '"><span class="status-dot"></span>' + escapeHtml(statusLabel) + '</span>' +
         '</div>' +
         (notes ? '<div class="todo-card-notes">' + escapeHtml(notes) + '</div>' : '') +
@@ -2879,8 +3211,11 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       if (linkBtn) {
         linkBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          if (todo.link) {
-            vscode.postMessage({ type: 'todoOpenLink', url: todo.link });
+          if (linkCount === 1) {
+            vscode.postMessage({ type: 'todoOpenLink', url: links[0] });
+          } else {
+            // Open the detail view so the user can pick a specific link.
+            openTodoDetail(todo.id);
           }
         });
       }
@@ -2905,6 +3240,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
     function showTodoDetail(todo) {
       todoListView.style.display = 'none';
       todoDetailView.classList.add('active');
+      document.getElementById('todosPanel')?.classList.add('in-detail');
 
       todoDetailTitle.textContent = todo.title;
 
@@ -2915,7 +3251,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
         '<button class="act-btn primary" id="tEditTitle">Rename</button>' +
         '<button class="act-btn" id="tSetStatus">Status</button>' +
         '<button class="act-btn" id="tAttach">+ Session</button>' +
-        '<button class="act-btn" id="tLink">' + (todo.link ? 'Edit Link' : '+ Link') + '</button>' +
+        '<button class="act-btn" id="tAddLink">+ Link</button>' +
         '<button class="act-btn danger" id="tDelete">Delete</button>';
 
       const attached = todo.attachedSessions || (todo.sessionIds || []).map(id => ({ id, title: '(unknown session)' }));
@@ -2935,13 +3271,18 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
 
       const safeNotes = escapeHtml(todo.notes || '');
 
-      const linkHtml = todo.link
-        ? '<div class="link-row">' +
-            '<span class="link-icon">&#x1F517;</span>' +
-            '<a href="#" class="link-anchor" id="tLinkOpen" title="' + escapeHtml(todo.link) + '">' + escapeHtml(todo.link) + '</a>' +
-            '<button class="link-action" id="tLinkClear" title="Remove link">&#x2715;</button>' +
-          '</div>'
-        : '<button class="act-btn" id="tLinkAdd" style="font-size:10px;padding:2px 8px;">+ Add Link</button>';
+      const todoLinks = Array.isArray(todo.links) ? todo.links : [];
+      const linksHtml = todoLinks.length > 0
+        ? todoLinks.map((url, i) =>
+            '<div class="link-row" data-link-idx="' + i + '">' +
+              '<span class="link-icon">&#x1F517;</span>' +
+              '<a href="#" class="link-anchor" data-act="open" title="' + escapeHtml(url) + '">' + escapeHtml(url) + '</a>' +
+              '<button class="link-action" data-act="edit" title="Edit">&#x270E;</button>' +
+              '<button class="link-action" data-act="remove" title="Remove">&#x2715;</button>' +
+            '</div>'
+          ).join('') +
+          '<button class="act-btn" id="tLinkAddInline" style="font-size:10px;padding:2px 8px;margin-top:4px;">+ Add Link</button>'
+        : '<button class="act-btn" id="tLinkAddInline" style="font-size:10px;padding:2px 8px;">+ Add Link</button>';
 
       todoDetailBody.innerHTML =
         '<div class="detail-section">' +
@@ -2949,8 +3290,8 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
           '<span class="todo-status-pill status-' + status + '"><span class="status-dot"></span>' + escapeHtml(statusLabel) + '</span>' +
         '</div>' +
         '<div class="detail-section">' +
-          '<h4>Link</h4>' +
-          linkHtml +
+          '<h4>Links (' + todoLinks.length + ')</h4>' +
+          linksHtml +
         '</div>' +
         '<div class="detail-section">' +
           '<h4>Notes</h4>' +
@@ -2981,28 +3322,38 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       tAttach.addEventListener('click', () => {
         vscode.postMessage({ type: 'todoAttachSession', todoId: todo.id });
       });
-      const tLink = document.getElementById('tLink');
-      tLink?.addEventListener('click', () => {
-        vscode.postMessage({ type: 'todoSetLink', todoId: todo.id });
+      const tAddLink = document.getElementById('tAddLink');
+      tAddLink?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoAddLink', todoId: todo.id });
       });
       tDelete.addEventListener('click', () => {
         vscode.postMessage({ type: 'todoDelete', todoId: todo.id });
       });
 
-      const tLinkOpen = document.getElementById('tLinkOpen');
-      tLinkOpen?.addEventListener('click', (e) => {
-        e.preventDefault();
-        if (todo.link) {
-          vscode.postMessage({ type: 'todoOpenLink', url: todo.link });
-        }
+      const tLinkAddInline = document.getElementById('tLinkAddInline');
+      tLinkAddInline?.addEventListener('click', () => {
+        vscode.postMessage({ type: 'todoAddLink', todoId: todo.id });
       });
-      const tLinkClear = document.getElementById('tLinkClear');
-      tLinkClear?.addEventListener('click', () => {
-        vscode.postMessage({ type: 'todoClearLink', todoId: todo.id });
-      });
-      const tLinkAdd = document.getElementById('tLinkAdd');
-      tLinkAdd?.addEventListener('click', () => {
-        vscode.postMessage({ type: 'todoSetLink', todoId: todo.id });
+
+      todoDetailBody.querySelectorAll('.link-row').forEach(row => {
+        const idxAttr = row.getAttribute('data-link-idx');
+        const idx = idxAttr !== null ? parseInt(idxAttr, 10) : -1;
+        const links = Array.isArray(todo.links) ? todo.links : [];
+        row.querySelectorAll('[data-act]').forEach(el => {
+          el.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const act = el.getAttribute('data-act');
+            if (idx < 0 || idx >= links.length) { return; }
+            if (act === 'open') {
+              vscode.postMessage({ type: 'todoOpenLink', url: links[idx] });
+            } else if (act === 'edit') {
+              vscode.postMessage({ type: 'todoEditLinkAt', todoId: todo.id, index: idx });
+            } else if (act === 'remove') {
+              vscode.postMessage({ type: 'todoRemoveLinkAt', todoId: todo.id, index: idx });
+            }
+          });
+        });
       });
 
       // Save notes on blur if changed
@@ -3039,6 +3390,7 @@ export class SessionSidebarProvider implements vscode.WebviewViewProvider {
       openTodoId = null;
       todoDetailView.classList.remove('active');
       todoListView.style.display = 'block';
+      document.getElementById('todosPanel')?.classList.remove('in-detail');
     });
 
     newTodoBtn.addEventListener('click', () => {
